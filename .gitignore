@@ -1,0 +1,22 @@
+# Compiled Object files
+build/
+debug/
+bin/
+lib/
+_deps/
+.vscode/
+.idea/
+CMakeFiles/
+
+
+*.gfa
+*.cereal
+*.anno
+*.paf
+
+*.txt
+cmake*
+!CMakeLists.txt
+
+Makefile
+test_build/CTestTestfile.cmake
