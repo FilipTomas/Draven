@@ -3,12 +3,17 @@
 Draven is a de novo genome assembler for long uncorrected or corrected reads.
 
 ## Usage
-To build raven run the following commands (< 30s):
+To build Draven run the following commands (< 30s):
 
 ```bash
 git clone https://github.com/lbcb-sci/raven && cd raven && mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release .. && make
 ```
+To use a specific model use:
+```bash
+cp models/model.hpp /third_party/catboost_model/catboost_model.hpp
+```
+Then rebuild.
 
 which will create raven executable and unit tests (running `make install` will install the executable to your system). Running the executable will display the following usage:
 
@@ -45,7 +50,6 @@ usage: raven [options ...] <sequences>
       prints the version number
     -h, --help
       prints the usage
-
 
 
 #### Dependencies
