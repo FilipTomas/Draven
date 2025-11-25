@@ -7,7 +7,7 @@ To build Draven run the following commands (< 30s):
 
 ```bash
 git clone [https://github.com/lbcb-sci/raven](https://github.com/FilipTomas/Draven.git) && cd draven && mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release .. && make
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. && make
 ```
 To use a specific model use:
 ```bash
