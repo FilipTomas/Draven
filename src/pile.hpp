@@ -267,7 +267,10 @@ namespace raven {
 
     std::vector<std::pair<std::uint32_t, std::uint32_t>> find_region_positions(kMerType type, std::uint32_t span_start, std::uint32_t span_end);
 
-    std::set<std::uint64_t> k_mers_in_region(std::uint32_t start, std::uint32_t end);
+    // Append the k-mer ids in [start, end] to `out` (no dedup/sort here;
+    // callers concatenate across regions then sort+unique once).
+    void append_kmers_in_region(std::uint32_t start, std::uint32_t end,
+                                std::vector<std::uint64_t>& out) const;
 
     
   private:

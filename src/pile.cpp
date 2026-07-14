@@ -98,12 +98,11 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> Pile::find_region_positions
     return positions;
 };
 
-std::set<std::uint64_t> Pile::k_mers_in_region(std::uint32_t start, std::uint32_t end){
-  std::set<std::uint64_t> kmers;
+void Pile::append_kmers_in_region(std::uint32_t start, std::uint32_t end,
+                                  std::vector<std::uint64_t>& out) const {
   for(std::uint32_t i = start; i<=end; i++){
-    kmers.insert(k_mer_ids_[i]);
+    out.push_back(k_mer_ids_[i]);
   }
-  return kmers;
 };
 
 

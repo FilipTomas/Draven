@@ -336,10 +336,10 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
 
-  graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_initial_overlaps_filename);
-  std::cerr << "[raven::Graph::Construct] initial overlaps printed"
-            << std::endl;
-  exit(0);
+  // graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_initial_overlaps_filename);
+  // std::cerr << "[raven::Graph::Construct] initial overlaps printed"
+  //           << std::endl;
+  // exit(0);
 
   ResolveContainedReads(sequences, extended_overlaps, timer, 3);
 
@@ -657,35 +657,48 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     (void)sink;
   };
 
-  auto calc_jaccard =[&](const std::set<std::uint64_t>& set1,
-                         const std::set<std::uint64_t>& set2) -> float{
-    auto it1 = set1.begin();
-    auto it2 = set2.begin();
+  // Jaccard over two SORTED, DEDUPED vectors (same semantics as the previous
+  // std::set version, but cache-friendly and allocation-light).
+  auto calc_jaccard =[&](const std::vector<std::uint64_t>& a,
+                         const std::vector<std::uint64_t>& b) -> float{
+    std::size_t i = 0, j = 0;
+    std::size_t intersection = 0;
+    std::size_t union_count = 0;
 
-    size_t intersection = 0;
-    size_t union_count = 0;
-    
-    while(it1 != set1.end() && it2 != set2.end()){
-      if(*it1 == *it2){
+    while(i < a.size() && j < b.size()){
+      if(a[i] == b[j]){
         ++intersection;
         ++union_count;
-        ++it1;
-        ++it2;
-      } else if(*it1 < *it2){
+        ++i;
+        ++j;
+      } else if(a[i] < b[j]){
         ++union_count;
-        ++it1;
+        ++i;
       } else {
         ++union_count;
-        ++it2;
+        ++j;
       };
     };
 
-    union_count += std::distance(it1, set1.end());
-    union_count += std::distance(it2, set2.end());
+    union_count += (a.size() - i) + (b.size() - j);
 
     if (union_count == 0) return 0.0f;
 
     return static_cast<float>(intersection) / static_cast<float>(union_count);
+  };
+
+  // Gather the k-mer ids of the given regions of a pile into one sorted, deduped
+  // vector (replaces per-region std::set construction + merging).
+  auto collect_sorted_kmers =[&](std::uint32_t pile_id,
+      const std::vector<std::pair<std::uint32_t, std::uint32_t>>& positions)
+      -> std::vector<std::uint64_t>{
+    std::vector<std::uint64_t> kmers;
+    for(const auto& p : positions){
+      graph_.piles_[pile_id]->append_kmers_in_region(p.first, p.second, kmers);
+    }
+    std::sort(kmers.begin(), kmers.end());
+    kmers.erase(std::unique(kmers.begin(), kmers.end()), kmers.end());
+    return kmers;
   };
 
   auto find_similarity_for_region =
@@ -717,21 +730,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
               rhs_to   > k_mer_size ? rhs_to   - k_mer_size : 0);
 
       if (!lhs_positions.empty() && !rhs_positions.empty()) {
-          std::set<std::uint64_t> lhs_kmers;
-          std::set<std::uint64_t> rhs_kmers;
-
-          for (auto& position : lhs_positions) {
-              std::set<std::uint64_t> tmp =
-                  graph_.piles_[lhs_id]->k_mers_in_region(position.first, position.second);
-              lhs_kmers.insert(tmp.begin(), tmp.end());
-          }
-
-          for (auto& position : rhs_positions) {
-              std::set<std::uint64_t> tmp =
-                  graph_.piles_[rhs_id]->k_mers_in_region(position.first, position.second);
-              rhs_kmers.insert(tmp.begin(), tmp.end());
-          }
-
+          std::vector<std::uint64_t> lhs_kmers = collect_sorted_kmers(lhs_id, lhs_positions);
+          std::vector<std::uint64_t> rhs_kmers = collect_sorted_kmers(rhs_id, rhs_positions);
           return calc_jaccard(lhs_kmers, rhs_kmers);
       } else {
           return 0.0f;
@@ -829,17 +829,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         
         if(!lhs_hap_positions.empty() && !rhs_hap_positions.empty()){
           total_ovlp.hap_regions = true;
-          std::set<std::uint64_t> lhs_hap_kmers;
-          std::set<std::uint64_t> rhs_hap_kmers;
-          for(auto& positions : lhs_hap_positions){
-            std::set<std::uint64_t> tmp = graph_.piles_[ovlp.lhs_id]->k_mers_in_region(positions.first, positions.second);
-            lhs_hap_kmers.insert(tmp.begin(), tmp.end());
-          };
-
-          for(auto& positions : rhs_hap_positions){
-            std::set<std::uint64_t> tmp = graph_.piles_[ovlp.rhs_id]->k_mers_in_region(positions.first, positions.second);
-            rhs_hap_kmers.insert(tmp.begin(), tmp.end());
-          }
+          std::vector<std::uint64_t> lhs_hap_kmers = collect_sorted_kmers(ovlp.lhs_id, lhs_hap_positions);
+          std::vector<std::uint64_t> rhs_hap_kmers = collect_sorted_kmers(ovlp.rhs_id, rhs_hap_positions);
           total_ovlp.jaccard_index = calc_jaccard(lhs_hap_kmers, rhs_hap_kmers);
         };
         total_ovlp.lhs_hap = graph_.piles_[total_ovlp.overlap.lhs_id]->return_haploid(
@@ -876,15 +867,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
             float dip_jaccard = 0.0f;
             if (!lhs_dip_positions.empty() && !rhs_dip_positions.empty()) {
-                std::set<std::uint64_t> lhs_dip_kmers, rhs_dip_kmers;
-                for (auto& pos : lhs_dip_positions) {
-                    auto tmp = graph_.piles_[ovlp.lhs_id]->k_mers_in_region(pos.first, pos.second);
-                    lhs_dip_kmers.insert(tmp.begin(), tmp.end());
-                }
-                for (auto& pos : rhs_dip_positions) {
-                    auto tmp = graph_.piles_[ovlp.rhs_id]->k_mers_in_region(pos.first, pos.second);
-                    rhs_dip_kmers.insert(tmp.begin(), tmp.end());
-                }
+                std::vector<std::uint64_t> lhs_dip_kmers = collect_sorted_kmers(ovlp.lhs_id, lhs_dip_positions);
+                std::vector<std::uint64_t> rhs_dip_kmers = collect_sorted_kmers(ovlp.rhs_id, rhs_dip_positions);
                 dip_jaccard = calc_jaccard(lhs_dip_kmers, rhs_dip_kmers);
             }
             if(both_hor){
@@ -1647,7 +1631,7 @@ void Graph_Constructor::AlignBackboneReads(std::vector<std::unique_ptr<biosoup::
     if(graph_.piles_[i]->is_backbone() && !graph_.piles_[i]->is_strong_contained()){
       std::string lhs_full = sequences[i]->InflateData();
       for(auto& overlap : overlaps[i]){
-        if(overlap.classification_label == 2){
+        if(overlap.classification_label != 1){
           // std::string lhs_full = sequences[i]->InflateData();
           std::string lhs = lhs_full.substr(
                             overlap.lhs_begin_original,
