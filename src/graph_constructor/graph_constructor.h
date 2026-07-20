@@ -3,10 +3,12 @@
 #define RAVEN_GRAPH_CONSTRUCTOR_H
 
 #include <memory>
+#include <string>
 #include "biosoup/nucleic_acid.hpp"
 #include "pile.hpp"
 #include "option_manager.h"
 #include "biosoup/timer.hpp"
+#include "ram/kmer_counter.hpp"
 #include <numeric>
 
 namespace raven {
@@ -23,6 +25,15 @@ public:
   void Construct(
     std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,  // NOLINT
     Program_Parameters &param);
+
+  // Stream reads from `sequence_path` while counting their k-mers in-process,
+  // so parsing (single-threaded I/O) overlaps counting (pool). Fills
+  // `sequences` and populates the internal counter that Construct then reuses
+  // (used on the --internal-count path instead of a separate Parse + count).
+  void LoadAndCount(
+    const std::string &sequence_path,
+    Program_Parameters &param,
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences);
   
   void ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,  // NOLINT
     Program_Parameters &param);
@@ -134,6 +145,8 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
 
   Graph &graph_;
   std::shared_ptr<thread_pool::ThreadPool> thread_pool_;
+  // Populated by LoadAndCount (overlapped load+count); reused by MapSequencesFast.
+  std::unique_ptr<ram::KmerCounter> internal_counter_;
 
   double disagreement_;
 };

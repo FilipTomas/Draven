@@ -3,9 +3,11 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <filesystem>
 #include <cassert>
 #include "graph.hpp"
 #include "graph_constructor.h"
+#include "parser.h"
 #include "overlap.h"
 #include "overlap_parser.h"
 #include "biosoup/overlap.hpp"
@@ -176,6 +178,73 @@ Graph_Constructor::Graph_Constructor(Graph &graph, std::shared_ptr<thread_pool::
   : graph_(graph), thread_pool_(thread_pool ?
                                 thread_pool :
                                 std::make_shared<thread_pool::ThreadPool>(1)) {
+}
+
+void Graph_Constructor::LoadAndCount(
+    const std::string &sequence_path,
+    Program_Parameters &param,
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences) {
+  raven::Parser parser;
+  auto sparser = parser.CreateParser(sequence_path);
+  if (sparser == nullptr) {
+    return;
+  }
+
+  // Bloom sizing. Total distinct k-mers isn't known before parsing, so for the
+  // auto case estimate an upper bound from the file size (bytes >= bases), which
+  // safely over-sizes the bloom (extra bloom memory, lower false-positive rate).
+  std::uint64_t bloom_hint;
+  if (param.bloom_gb < 0.0) {
+    std::uint64_t fsize = 0;
+    try { fsize = std::filesystem::file_size(sequence_path); } catch (...) {}
+    bloom_hint = fsize;  // ~1 bit per input byte after next-pow2 rounding
+    std::cerr << "[raven::] internal counter bloom: auto (by file size)" << std::endl;
+  } else if (param.bloom_gb == 0.0) {
+    bloom_hint = 0;  // disable bloom -> exact count + prune
+    std::cerr << "[raven::] internal counter bloom: disabled (exact count)" << std::endl;
+  } else {
+    bloom_hint = static_cast<std::uint64_t>(
+        param.bloom_gb * static_cast<double>(1ULL << 33));  // GB -> bits
+    std::cerr << "[raven::] internal counter bloom: " << param.bloom_gb << " GB" << std::endl;
+  }
+
+  internal_counter_ = std::make_unique<ram::KmerCounter>(
+      param.kmer_len, thread_pool_, /*min_count=*/2, /*bloom_capacity_hint=*/bloom_hint);
+
+  biosoup::Timer timer{};
+  timer.Start();
+
+  // Parse one chunk at a time (single-threaded decode); dispatch each chunk's
+  // counting to the pool WITHOUT blocking, so the count overlaps parsing the
+  // next chunk. Reads are appended to `sequences`; the NucleicAcid objects are
+  // heap-allocated so the raw pointers handed to CountAsync stay valid across
+  // the moves/reallocations.
+  const std::uint64_t chunk_bytes = 1ULL << 28;  // 256 MB of input per chunk
+  std::uint64_t total = 0;
+  while (true) {
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> chunk;
+    try {
+      chunk = sparser->Parse(chunk_bytes);
+    } catch (const std::invalid_argument &exception) {
+      std::cerr << exception.what() << std::endl;
+      break;
+    }
+    if (chunk.empty()) {
+      break;
+    }
+    for (const auto &read : chunk) {
+      internal_counter_->CountAsync(read.get());
+    }
+    for (auto &read : chunk) {
+      sequences.emplace_back(std::move(read));
+    }
+    total += chunk.size();
+  }
+
+  internal_counter_->Finalize();
+  std::cerr << "[raven::] loaded + counted " << total << " sequences ("
+            << internal_counter_->num_distinct() << " distinct k-mers >= 2) "
+            << std::fixed << timer.Stop() << "s" << std::endl;
 }
 
 void Graph_Constructor::Construct(
@@ -904,42 +973,45 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
   // Count source: in-process internal counter (--internal-count) or the
   // precomputed FastK table. The counter must outlive every engine call below.
-  std::unique_ptr<ram::KmerCounter> internal_counter;
+  std::unique_ptr<ram::KmerCounter> internal_counter;  // local fallback
   if (param.internal_count) {
-    // Bloom sizing (bloom_capacity_hint is interpreted as a minimum bit count):
-    //   --bloom-gb < 0  -> auto: size by total k-mer instances (safe upper
-    //                      bound on distinct k-mers)
-    //   --bloom-gb == 0 -> disable bloom: exact count + prune (no false
-    //                      positives, holds singletons transiently)
-    //   --bloom-gb  > 0 -> that many GB of bloom bits (1 GB = 2^33 bits)
-    std::uint64_t bloom_hint;
-    if (param.bloom_gb < 0.0) {
-      bloom_hint = 0;
-      for (const auto& s : sequences) {
-        bloom_hint += s->inflated_len;
-      }
-      std::cerr << "[raven::] internal counter bloom: auto (by k-mer instances)"
-                << std::endl;
-    } else if (param.bloom_gb == 0.0) {
-      bloom_hint = 0;  // disable bloom -> exact
-      std::cerr << "[raven::] internal counter bloom: disabled (exact count)"
-                << std::endl;
+    if (internal_counter_ != nullptr) {
+      // Preloaded by LoadAndCount (counting was overlapped with parsing).
+      minimizer_engine.set_internal_counter(internal_counter_.get());
     } else {
-      bloom_hint = static_cast<std::uint64_t>(
-          param.bloom_gb * static_cast<double>(1ULL << 33));  // GB -> bits
-      std::cerr << "[raven::] internal counter bloom: " << param.bloom_gb
-                << " GB" << std::endl;
+      // Not preloaded: count here (not overlapped with the read parse).
+      // Bloom sizing (bloom_capacity_hint is a minimum bit count):
+      //   --bloom-gb < 0  -> auto: size by total k-mer instances
+      //   --bloom-gb == 0 -> disable bloom: exact count + prune
+      //   --bloom-gb  > 0 -> that many GB of bloom bits (1 GB = 2^33 bits)
+      std::uint64_t bloom_hint;
+      if (param.bloom_gb < 0.0) {
+        bloom_hint = 0;
+        for (const auto& s : sequences) {
+          bloom_hint += s->inflated_len;
+        }
+        std::cerr << "[raven::] internal counter bloom: auto (by k-mer instances)"
+                  << std::endl;
+      } else if (param.bloom_gb == 0.0) {
+        bloom_hint = 0;  // disable bloom -> exact
+        std::cerr << "[raven::] internal counter bloom: disabled (exact count)"
+                  << std::endl;
+      } else {
+        bloom_hint = static_cast<std::uint64_t>(
+            param.bloom_gb * static_cast<double>(1ULL << 33));  // GB -> bits
+        std::cerr << "[raven::] internal counter bloom: " << param.bloom_gb
+                  << " GB" << std::endl;
+      }
+      internal_counter = std::make_unique<ram::KmerCounter>(
+          param.kmer_len, thread_pool_, /*min_count=*/2,
+          /*bloom_capacity_hint=*/bloom_hint);
+      timer.Start();
+      internal_counter->Count(sequences.begin(), sequences.end());
+      std::cerr << "[raven::] internal k-mer count: "
+                << internal_counter->num_distinct() << " distinct (>= 2) "
+                << std::fixed << timer.Stop() << "s" << std::endl;
+      minimizer_engine.set_internal_counter(internal_counter.get());
     }
-    internal_counter = std::make_unique<ram::KmerCounter>(
-        param.kmer_len, thread_pool_, /*min_count=*/2,
-        /*bloom_capacity_hint=*/bloom_hint);
-    timer.Start();
-    internal_counter->Count(sequences.begin(), sequences.end());
-    std::cerr << "[raven::] internal k-mer count: "
-              << internal_counter->num_distinct() << " distinct (>= 2) "
-              << std::fixed << timer.Stop() << "s" << std::endl;
-
-    minimizer_engine.set_internal_counter(internal_counter.get());
   } else if(!param.minimizers){
     minimizer_engine.LoadFastK();
   }

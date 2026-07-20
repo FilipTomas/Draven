@@ -53,13 +53,21 @@ int main(int argc, char **argv) {
   raven::Parser parser;
   std::vector<std::unique_ptr<biosoup::NucleicAcid>> sequences;
 
+  raven::Graph_Constructor graph_constructor{graph, thread_pool};
+
   if ((graph.state_manager_.construct_any_state() || param.num_polishing_rounds > 2) && !param.skip_contruction) {
     try {
-      auto sparser = parser.CreateParser(param.sequence_path);
-      if (sparser == nullptr) {
-        return 1;
+      if (param.internal_count) {
+        // Stream reads while counting k-mers in-process (overlaps parsing with
+        // counting); populates the internal counter reused by construction.
+        graph_constructor.LoadAndCount(param.sequence_path, param, sequences);
+      } else {
+        auto sparser = parser.CreateParser(param.sequence_path);
+        if (sparser == nullptr) {
+          return 1;
+        }
+        sequences = sparser->Parse(-1);
       }
-      sequences = sparser->Parse(-1);
     } catch (const std::invalid_argument &exception) {
       std::cerr << exception.what() << std::endl;
       return 1;
@@ -80,7 +88,6 @@ int main(int argc, char **argv) {
   }
 
 
-  raven::Graph_Constructor graph_constructor{graph, thread_pool};
   if (!param.skip_contruction && !param.correction_overlaps){
     std::cout << "Constructing graph with params: kmer_size:" << param.kmer_len  << " winodw_size:" << param.window_len << " " << std::endl;
     graph_constructor.Construct(sequences, param);
