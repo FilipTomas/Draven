@@ -1,5 +1,6 @@
 
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <cassert>
@@ -336,10 +337,10 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
 
-  // graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_initial_overlaps_filename);
-  // std::cerr << "[raven::Graph::Construct] initial overlaps printed"
-  //           << std::endl;
-  // exit(0);
+  graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_initial_overlaps_filename);
+  std::cerr << "[raven::Graph::Construct] initial overlaps printed"
+            << std::endl;
+  exit(0);
 
   ResolveContainedReads(sequences, extended_overlaps, timer, 3);
 
@@ -506,7 +507,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     param.fraction,
     param.coverage,
     0.5f,
-    "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19",
+    param.fastk_path,
     param.minimizers,
     100000,
     50,
@@ -900,9 +901,49 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
   // minimizers for both index building and mapping. The minimizers-mode path
   // is left byte-identical.
   const bool use_fused_fastk = !param.minimizers && !param.no_fuse;
-  if(!param.minimizers){
+
+  // Count source: in-process internal counter (--internal-count) or the
+  // precomputed FastK table. The counter must outlive every engine call below.
+  std::unique_ptr<ram::KmerCounter> internal_counter;
+  if (param.internal_count) {
+    // Bloom sizing (bloom_capacity_hint is interpreted as a minimum bit count):
+    //   --bloom-gb < 0  -> auto: size by total k-mer instances (safe upper
+    //                      bound on distinct k-mers)
+    //   --bloom-gb == 0 -> disable bloom: exact count + prune (no false
+    //                      positives, holds singletons transiently)
+    //   --bloom-gb  > 0 -> that many GB of bloom bits (1 GB = 2^33 bits)
+    std::uint64_t bloom_hint;
+    if (param.bloom_gb < 0.0) {
+      bloom_hint = 0;
+      for (const auto& s : sequences) {
+        bloom_hint += s->inflated_len;
+      }
+      std::cerr << "[raven::] internal counter bloom: auto (by k-mer instances)"
+                << std::endl;
+    } else if (param.bloom_gb == 0.0) {
+      bloom_hint = 0;  // disable bloom -> exact
+      std::cerr << "[raven::] internal counter bloom: disabled (exact count)"
+                << std::endl;
+    } else {
+      bloom_hint = static_cast<std::uint64_t>(
+          param.bloom_gb * static_cast<double>(1ULL << 33));  // GB -> bits
+      std::cerr << "[raven::] internal counter bloom: " << param.bloom_gb
+                << " GB" << std::endl;
+    }
+    internal_counter = std::make_unique<ram::KmerCounter>(
+        param.kmer_len, thread_pool_, /*min_count=*/2,
+        /*bloom_capacity_hint=*/bloom_hint);
+    timer.Start();
+    internal_counter->Count(sequences.begin(), sequences.end());
+    std::cerr << "[raven::] internal k-mer count: "
+              << internal_counter->num_distinct() << " distinct (>= 2) "
+              << std::fixed << timer.Stop() << "s" << std::endl;
+
+    minimizer_engine.set_internal_counter(internal_counter.get());
+  } else if(!param.minimizers){
     minimizer_engine.LoadFastK();
   }
+
   if (use_fused_fastk) {
     minimizer_engine.InitReadStore(sequences.size());
   }

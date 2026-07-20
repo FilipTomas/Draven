@@ -22,6 +22,13 @@ struct Program_Parameters {
   bool hpc = false;
   bool minimizers = false;
   bool no_fuse = false;  // force the un-fused 3-pass FastK path (benchmarking)
+  bool internal_count = false;  // count k-mers in-process instead of loading FastK
+  // internal-counter bloom size in GB. <0 = auto (size by k-mer instances);
+  // 0 = bloom disabled (exact count + prune, no false positives); >0 = that
+  // many GB of bloom bits.
+  double bloom_gb = -1.0;
+  // path to the precomputed FastK counts (used when --internal-count is off)
+  std::string fastk_path = "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19";
 
   std::string error_corrected_reads = "";
   std::string herro_snps_path = "";
