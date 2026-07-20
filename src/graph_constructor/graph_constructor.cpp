@@ -622,7 +622,11 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     };
 
 
-    graph_.piles_[i]->set_k_kmer_ids(ids);
+    // Store per-position k-mer ids only if requested; otherwise they are
+    // recomputed on demand during the Jaccard step (saves ~8 B/position).
+    if (param.store_kmer_ids) {
+      graph_.piles_[i]->set_k_kmer_ids(ids);
+    }
 
 
     WindowedCnnInput cnn_input = ComputeWindowFeaturesInference(
@@ -764,7 +768,12 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       -> std::vector<std::uint64_t>{
     std::vector<std::uint64_t> kmers;
     for(const auto& p : positions){
-      graph_.piles_[pile_id]->append_kmers_in_region(p.first, p.second, kmers);
+      if (param.store_kmer_ids) {
+        graph_.piles_[pile_id]->append_kmers_in_region(p.first, p.second, kmers);
+      } else {
+        // recompute the region's k-mer ids from the read (same ids as stored)
+        minimizer_engine.KmerIdsInRegion(*sequences[pile_id], p.first, p.second, kmers);
+      }
     }
     std::sort(kmers.begin(), kmers.end());
     kmers.erase(std::unique(kmers.begin(), kmers.end()), kmers.end());

@@ -27,6 +27,9 @@ struct Program_Parameters {
   // 0 = bloom disabled (exact count + prune, no false positives); >0 = that
   // many GB of bloom bits.
   double bloom_gb = -1.0;
+  // store per-position k-mer ids on each pile (faster Jaccard, more memory)
+  // instead of recomputing them on demand (default: recompute)
+  bool store_kmer_ids = false;
   // path to the precomputed FastK counts (used when --internal-count is off)
   std::string fastk_path = "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19";
 

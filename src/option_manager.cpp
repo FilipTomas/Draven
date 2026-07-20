@@ -36,6 +36,7 @@ enum program_opt {
   opt_no_fuse,
   opt_internal_count,
   opt_bloom_gb,
+  opt_store_kmer_ids,
   opt_fastk_counts,
   opt_threads,
 
@@ -83,6 +84,7 @@ static struct option options[] = {
     {"no-fuse", no_argument, nullptr, opt_no_fuse},
     {"internal-count", no_argument, nullptr, opt_internal_count},
     {"bloom-gb", required_argument, nullptr, opt_bloom_gb},
+    {"store-kmer-ids", no_argument, nullptr, opt_store_kmer_ids},
     {"fastk-counts", required_argument, nullptr, opt_fastk_counts},
     {"threads", required_argument, nullptr, opt_threads},
 
@@ -190,6 +192,10 @@ void Help() {
             "      default: -1 (auto: size by k-mer instances)\n"
             "      internal-counter bloom size in GB; 0 disables the bloom (exact\n"
             "      count + prune, no false positives, uses more memory)\n"
+            "    --store-kmer-ids\n"
+            "      default: false\n"
+            "      store per-position k-mer ids on each pile (faster Jaccard, more\n"
+            "      memory) instead of recomputing them on demand\n"
             "    --fastk-counts <string>\n"
             "      path to the precomputed FastK counts (used when --internal-count\n"
             "      is off); build FastK on the same reads for an apples-to-apples\n"
@@ -358,6 +364,9 @@ int ProcessParameters(int argc, char **argv, Program_Parameters& param) {
         break;
       case opt_bloom_gb:
         param.bloom_gb = std::atof(optarg);
+        break;
+      case opt_store_kmer_ids:
+        param.store_kmer_ids = true;
         break;
       case opt_fastk_counts:
         param.fastk_path = optarg;
