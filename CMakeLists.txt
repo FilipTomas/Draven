@@ -195,6 +195,7 @@ add_library(raven
   src/graph_constructor/overlap_parser.cpp
   src/graph_constructor/ram_overlap.cpp
   src/graph_constructor/cnn_preprocessing.cpp
+  src/graph_constructor/overlap_selection.cpp
 )
 
 target_link_libraries(raven PUBLIC

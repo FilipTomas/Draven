@@ -14,6 +14,11 @@ struct edlib_align {
   std::uint32_t block_length;
   std::string cigar;
   std::int32_t edit_distance;
+  // For HW/infix alignment: the [start, end] positions (inclusive) of the
+  // aligned infix within the target that was passed to the aligner. Unused
+  // (0) for global (NW) alignment.
+  std::int32_t target_start = 0;
+  std::int32_t target_end = 0;
 };
 
 struct extended_overlap {
@@ -35,6 +40,11 @@ struct extended_overlap {
   std::uint32_t lhs_end_original;
   std::uint32_t rhs_begin_original;
   std::uint32_t rhs_end_original;
+
+  std::uint32_t correction_lhs_begin;
+  std::uint32_t correction_lhs_end;
+  std::uint32_t correction_rhs_begin;
+  std::uint32_t correction_rhs_end;
 
   float lhs_hap;
   float rhs_hap;

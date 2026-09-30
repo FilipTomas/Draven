@@ -1,8 +1,11 @@
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <iomanip>
 #include <filesystem>
 #include <cassert>
 #include "graph.hpp"
@@ -17,6 +20,7 @@
 #include "overlap_helpers.h"
 #include "annotation_helpers.h"
 #include "ram_overlap.h"
+#include "overlap_selection.h"
 #include "catboost_model.hpp"
 #include <ATen/Parallel.h>
 #include <torch/script.h>
@@ -133,45 +137,89 @@ std::vector<biosoup::Overlap> remove_duplicates(const std::vector<biosoup::Overl
     return result;
 }
 
-std::vector<ram_overlap>
-merge_fragments(const std::vector<biosoup::Overlap>& ovlps)
-{
-    std::vector<ram_overlap> result;
-    result.reserve(ovlps.size());         // upper bound
-
-    if (ovlps.empty()){
-        return result;
+// Merge Map's overlap fragments into ONE overlap per pair. A pair's chain is
+// often broken into several fragments by indel drift; keeping only the longest
+// and extrapolating its diagonal to the read ends mis-places the endpoints once
+// there are errors. Instead we span the OUTERMOST anchors of the best collinear
+// cluster, so both endpoints are real matched minimizers with the errors in
+// between spanned (not extrapolated). Fragments join a cluster only if they are
+// same-strand and on a consistent diagonal (within DIAG_TOL) -- this follows
+// indel drift but rejects repeat-induced off-diagonal fragments that would
+// otherwise fuse into a bogus giant overlap.
+std::vector<biosoup::Overlap>
+merge_fragments(std::vector<biosoup::Overlap> ovlps) {
+    if (ovlps.empty()) {
+        return {};
     }
 
-    // begin first group
-    ram_overlap curr = start_group(ovlps.front());
-    curr.n_fragments = 1;
+    // Diagonal along which a collinear chain runs: fwd overlaps keep rhs - lhs
+    // ~constant, reverse overlaps keep rhs + lhs ~constant.
+    auto diagonal = [](const biosoup::Overlap& o) -> std::int64_t {
+        return o.strand
+            ? static_cast<std::int64_t>(o.rhs_begin) - static_cast<std::int64_t>(o.lhs_begin)
+            : static_cast<std::int64_t>(o.rhs_begin) + static_cast<std::int64_t>(o.lhs_begin);
+    };
+    constexpr std::int64_t DIAG_TOL = 2000;  // allow indel drift, reject repeats
 
-    for (std::size_t i = 1; i < ovlps.size(); ++i) {
-        const auto& ov = ovlps[i];
+    std::sort(ovlps.begin(), ovlps.end(),
+        [](const biosoup::Overlap& a, const biosoup::Overlap& b) {
+            if (a.lhs_id != b.lhs_id) return a.lhs_id < b.lhs_id;
+            if (a.rhs_id != b.rhs_id) return a.rhs_id < b.rhs_id;
+            if (a.strand != b.strand) return a.strand < b.strand;
+            return a.lhs_begin < b.lhs_begin;
+        });
 
-        bool same_pair =
-            (ov.lhs_id == curr.lhs_id && ov.rhs_id == curr.rhs_id);
-
-        if (!same_pair) {
-            // commit the finished group
-            result.push_back(std::move(curr));
-            curr = start_group(ov);       // start new group
-        } else {
-            // extend current aggregate
-            curr.overlap_fragments.push_back(extended_overlap {ov, {}, 0, 0});
-            if (curr.lhs_begin > ov.lhs_begin){
-                curr.lhs_begin = ov.lhs_begin;
-            } else if (curr.lhs_end < ov.lhs_end) {
-                curr.lhs_end = ov.lhs_end;
-            };
-            // curr.lhs_end = ov.lhs_end;    // ovlps are ordered by lhs_begin
-            // curr.rhs_end = ov.rhs_end;
-            curr.n_fragments++;
+    std::vector<biosoup::Overlap> merged;
+    std::size_t g = 0;
+    while (g < ovlps.size()) {
+        std::size_t h = g;
+        while (h < ovlps.size() &&
+               ovlps[h].lhs_id == ovlps[g].lhs_id &&
+               ovlps[h].rhs_id == ovlps[g].rhs_id) {
+            ++h;
         }
+
+        // Within the pair [g, h) (sorted by strand then lhs_begin), greedily
+        // grow collinear same-strand clusters and keep the longest-query-span one.
+        biosoup::Overlap best{};
+        std::int64_t best_span = -1;
+
+        biosoup::Overlap cur = ovlps[g];
+        std::int64_t cur_diag = diagonal(ovlps[g]);
+        std::uint64_t cur_score = ovlps[g].score;
+
+        auto flush = [&]() {
+            cur.score = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(cur_score, 0xFFFFFFFFULL));
+            const std::int64_t span = static_cast<std::int64_t>(cur.lhs_end) -
+                                      static_cast<std::int64_t>(cur.lhs_begin);
+            if (span > best_span) { best = cur; best_span = span; }
+        };
+
+        for (std::size_t i = g + 1; i < h; ++i) {
+            std::int64_t dd = diagonal(ovlps[i]) - cur_diag;
+            if (dd < 0) dd = -dd;
+            const bool collinear =
+                (ovlps[i].strand == cur.strand) && (dd <= DIAG_TOL);
+            if (collinear) {
+                cur.lhs_begin = std::min(cur.lhs_begin, ovlps[i].lhs_begin);
+                cur.lhs_end   = std::max(cur.lhs_end,   ovlps[i].lhs_end);
+                cur.rhs_begin = std::min(cur.rhs_begin, ovlps[i].rhs_begin);
+                cur.rhs_end   = std::max(cur.rhs_end,   ovlps[i].rhs_end);
+                cur_diag = diagonal(ovlps[i]);  // follow the drift
+                cur_score += ovlps[i].score;
+            } else {
+                flush();
+                cur = ovlps[i];
+                cur_diag = diagonal(ovlps[i]);
+                cur_score = ovlps[i].score;
+            }
+        }
+        flush();
+        merged.push_back(best);
+        g = h;
     }
-    result.push_back(std::move(curr));    // flush last group
-    return result;
+    return merged;
 }
 
 Graph_Constructor::Graph_Constructor(Graph &graph, std::shared_ptr<thread_pool::ThreadPool> thread_pool)
@@ -308,10 +356,37 @@ void Graph_Constructor::Construct(
 void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, Program_Parameters &param){
     std::vector<std::vector<extended_overlap>> extended_overlaps(sequences.size());
     biosoup::Timer timer{};
-    std::cerr << "Only here!" << std::endl;
-    ConstructOverlapsForCorrection(sequences, extended_overlaps, timer, param);
-    //LoadOverlapsAndAlign(param, sequences, extended_overlaps);
-    AlignBackboneReads(sequences, extended_overlaps, timer, param);
+    // Overlaps (and their features) are computed here unless we only load an
+    // externally selected PAF (LoadOverlapsAndAlign).
+    const bool compute_overlaps = param.dump_overlaps_only ||
+                                  param.dump_all_overlaps ||
+                                  !param.rf_model_path.empty();
+
+    if (compute_overlaps) {
+      ConstructOverlapsForCorrection(sequences, extended_overlaps, timer, param);
+
+      if (param.dump_all_overlaps) {
+        // Raw overlaps were already dumped inside ConstructOverlapsForCorrection.
+        return;
+      }
+
+      if (param.dump_overlaps_only) {
+        // Debug: dump the correction overlaps (backbone, non strong-contained
+        // reads) with full features BEFORE alignment, then stop -- skips the
+        // costly alignment step.
+        std::cerr << "Printing pre-alignment backbone correction overlaps with features!"
+                  << std::endl;
+        graph_.PrintBackboneOverlapsWithFeatures(
+            extended_overlaps, sequences, "correction_overlaps_features.paf");
+        return;
+      }
+
+      SelectCorrectionOverlaps(sequences, extended_overlaps, param);
+      AlignCorrectionOverlaps(sequences, extended_overlaps);
+    } else {
+      LoadOverlapsAndAlign(param, sequences, extended_overlaps);
+    }
+    //AlignBackboneReads(sequences, extended_overlaps, timer, param);
     //ConstructOnlyBackboneGraph(sequences, extended_overlaps, timer, param);
     std::cerr << "[raven::Graph::Construct] reached checkpoint "
               << std::fixed << timer.Stop() << "s"
@@ -320,78 +395,998 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
     graph_.PrintCorrectionOverlaps(extended_overlaps, sequences, "correction.paf");
 }
 
-void Graph_Constructor::LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps){
-  std::ifstream file("/mnt/share1_Jabba/ftomas/centromere_fix/minimap2/minimap2_dedup.paf");
-  if (!file.is_open()) {
-    throw std::runtime_error("Error opening file: " + param.input_paf_path);
+// In-process replacement for mm2_draven_match.ipynb: score every backbone
+// correction overlap with the exported random forest, keep the top-K per
+// target window, and reset the kept overlaps to the state
+// LoadOverlapsAndAlign would load them in (plain coordinates, not aligned).
+void Graph_Constructor::SelectCorrectionOverlaps(
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+    std::vector<std::vector<extended_overlap>> &extended_overlaps,
+    Program_Parameters &param) {
+  biosoup::Timer timer{};
+  timer.Start();
+
+  overlap_selection::RandomForest forest;
+  forest.Load(param.rf_model_path);
+  std::cerr << "[raven::SelectCorrectionOverlaps] loaded " << forest.num_trees()
+            << " trees from " << param.rf_model_path << std::endl;
+
+  // Same reads PrintBackboneOverlapsWithFeatures dumps for the notebook.
+  auto is_corrected = [&](std::uint32_t i) -> bool {
+    return i < graph_.piles_.size() && graph_.piles_[i]->is_backbone() &&
+           !graph_.piles_[i]->is_strong_contained();
+  };
+
+  std::vector<std::vector<double>> probabilities(extended_overlaps.size());
+  std::vector<std::vector<bool>> selected(extended_overlaps.size());
+
+  auto score_pile = [&](std::uint32_t i) -> void {
+    const auto &pile = extended_overlaps[i];
+    if (!is_corrected(i) || pile.empty()) return;
+
+    std::vector<std::uint32_t> query_lengths(pile.size());
+    for (std::size_t k = 0; k < pile.size(); ++k) {
+      query_lengths[k] = sequences[pile[k].overlap.rhs_id]->inflated_len;
+    }
+
+    const std::uint32_t target_length = sequences[i]->inflated_len;
+    const auto features = overlap_selection::ComputeFeatures(
+        pile, target_length, query_lengths);
+    const std::size_t n_features = overlap_selection::FeatureNames().size();
+
+    auto &probs = probabilities[i];
+    probs.resize(pile.size());
+    for (std::size_t k = 0; k < pile.size(); ++k) {
+      probs[k] = forest.PredictProba(&features[k * n_features]);
+    }
+
+    selected[i] = overlap_selection::SelectWindowTopK(
+        pile, probs, target_length, param.rf_window_size, param.rf_top_k,
+        param.rf_require_full_window);
+  };
+
+  std::vector<std::future<void>> futures;
+  futures.reserve(extended_overlaps.size());
+  for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
+    futures.emplace_back(thread_pool_->Submit(score_pile, i));
   }
-  std::cerr << "Got to here" << std::endl;
-  std::map<std::string, std::uint32_t> sequence_name_to_seq_id;
-  for (std::uint32_t i = 0; i < sequences.size(); ++i) {
-    sequence_name_to_seq_id[sequences[i]->name] = sequences[i]->id;
+  for (const auto &it : futures) {
+    it.wait();
   }
 
-  std::cerr << "[raven::Graph::LoadHerroSNPs] loading overlaps from: " << param.input_paf_path << std::endl;
-  std::string line;
-  while (std::getline(file, line)) {
-    std::istringstream iss(line);
-    std::string item;
-    std::vector<std::string> items;
-    std::uint32_t lhs_seq_id;
-    std::uint32_t rhs_seq_id;
+  if (param.dump_rf_scores) {
+    // PAF key columns (query = rhs, target = lhs) + probability, joinable
+    // with the notebook's selected_top30_per_window.tsv.
+    std::ofstream os("rf_selection.tsv");
+    os << std::setprecision(std::numeric_limits<double>::max_digits10);
+    os << "qn\tql\tqs\tqe\tstrand\ttn\ttl\tts\tte\tpred_proba\tselected\n";
+    for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
+      for (std::size_t k = 0; k < probabilities[i].size(); ++k) {
+        const auto &o = extended_overlaps[i][k].overlap;
+        os << sequences[o.rhs_id]->name << '\t'
+           << sequences[o.rhs_id]->inflated_len << '\t'
+           << o.rhs_begin << '\t' << o.rhs_end << '\t'
+           << (o.strand ? '+' : '-') << '\t'
+           << sequences[o.lhs_id]->name << '\t'
+           << sequences[o.lhs_id]->inflated_len << '\t'
+           << o.lhs_begin << '\t' << o.lhs_end << '\t'
+           << probabilities[i][k] << '\t'
+           << (selected[i][k] ? 1 : 0) << '\n';
+      }
+    }
+    std::cerr << "[raven::SelectCorrectionOverlaps] wrote rf_selection.tsv"
+              << std::endl;
+  }
 
-    while (std::getline(iss, item, '\t')) {
-      items.push_back(item);
-    };
+  std::uint64_t candidates = 0;
+  std::uint64_t kept = 0;
+  std::uint64_t skipped = 0;
 
-    // lhs_seq_id = get_read_id(items[0], sequences);
-    lhs_seq_id = sequence_name_to_seq_id[items[0]];
-    // rhs_seq_id = get_read_id(items[5], sequences);
-    rhs_seq_id = sequence_name_to_seq_id[items[5]];
+  for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
+    std::vector<extended_overlap> pile;
+    pile.swap(extended_overlaps[i]);
+    if (selected[i].empty()) continue;
 
-    if (lhs_seq_id == (std::uint32_t )-1 || rhs_seq_id == (std::uint32_t )-1) {
-      continue;
-    } else {
-      biosoup::Overlap overlap{ lhs_seq_id, (std::uint32_t)std::stoi(items[2]), (std::uint32_t)std::stoi(items[3]),
-                                rhs_seq_id, (std::uint32_t)std::stoi(items[7]), (std::uint32_t)std::stoi(items[8]),
-                                255, items[4] == "+" ? true : false};
+    candidates += pile.size();
+    for (std::size_t k = 0; k < pile.size(); ++k) {
+      if (!selected[i][k]) continue;
+
+      const auto &o = pile[k].overlap;
+      // same validation as LoadOverlapsAndAlign
+      if (o.lhs_end <= o.lhs_begin || o.rhs_end <= o.rhs_begin ||
+          o.lhs_end > sequences[o.lhs_id]->inflated_len ||
+          o.rhs_end > sequences[o.rhs_id]->inflated_len) {
+        ++skipped;
+        continue;
+      }
+
+      biosoup::Overlap overlap{o.lhs_id, o.lhs_begin, o.lhs_end,
+                               o.rhs_id, o.rhs_begin, o.rhs_end,
+                               255, o.strand};
       edlib_align tmp = {};
-      extended_overlap total_ovlp{ overlap, tmp, 0, 0 };
-      total_ovlp.correction_overlap = true;
-      extended_overlaps[lhs_seq_id].emplace_back(total_ovlp);
+      extended_overlap total_ovlp{overlap, tmp, 0, 0};
+      total_ovlp.correction_overlap = false;
+      total_ovlp.lhs_begin_original = o.lhs_begin;
+      total_ovlp.lhs_end_original = o.lhs_end;
+      total_ovlp.rhs_begin_original = o.rhs_begin;
+      total_ovlp.rhs_end_original = o.rhs_end;
+
+      extended_overlaps[i].emplace_back(std::move(total_ovlp));
+      ++kept;
     }
   }
-  std::cerr << "[raven::LoadAndAlign] loaded overlaps from: " << param.input_paf_path << std::endl;
 
-  auto resolve_alignments = [&](std::uint32_t i) -> void {
-    std::string lhs_full = sequences[i]->InflateData();
-    for (auto& overlap : extended_overlaps[i]) {
-      std::string lhs = lhs_full.substr(
-          overlap.overlap.lhs_begin,
-          overlap.overlap.lhs_end - overlap.overlap.lhs_begin);
+  std::cerr << "[raven::SelectCorrectionOverlaps] kept " << kept << " / "
+            << candidates << " candidate overlaps ("
+            << (candidates ? 100.0 * kept / candidates : 0.0) << "%), "
+            << "window " << param.rf_window_size << ", top " << param.rf_top_k
+            << (param.rf_require_full_window ? ", full-window" : ", any-overlap")
+            << ", skipped " << skipped << " invalid, "
+            << std::fixed << timer.Stop() << "s" << std::endl;
+}
 
-      biosoup::NucleicAcid rhs_{ "",
-                                sequences[overlap.overlap.rhs_id]->InflateData(
-                                    overlap.overlap.rhs_begin,
-                                    overlap.overlap.rhs_end - overlap.overlap.rhs_begin) };
+// void Graph_Constructor::LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps){
+//   std::ifstream file("/mnt/share1_Jabba/ftomas/centromere_fix/overlap_selection/selected_top30_per_window.paf");
+//   if (!file.is_open()) {
+//     throw std::runtime_error("Error opening file: " + param.input_paf_path);
+//   }
+//   std::cerr << "Got to here" << std::endl;
+//   std::map<std::string, std::uint32_t> sequence_name_to_seq_id;
+//   for (std::uint32_t i = 0; i < sequences.size(); ++i) {
+//     sequence_name_to_seq_id[sequences[i]->name] = sequences[i]->id;
+//   }
 
-      if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+//   std::cerr << "[raven::Graph::LoadHerroSNPs] loading overlaps from: " << param.input_paf_path << std::endl;
+//   std::string line;
+//   while (std::getline(file, line)) {
+//     std::istringstream iss(line);
+//     std::string item;
+//     std::vector<std::string> items;
+//     std::uint32_t lhs_seq_id;
+//     std::uint32_t rhs_seq_id;
 
-      auto rhs = rhs_.InflateData();
+//     while (std::getline(iss, item, '\t')) {
+//       items.push_back(item);
+//     };
 
-      overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
+//     // lhs_seq_id = get_read_id(items[0], sequences);
+//     lhs_seq_id = sequence_name_to_seq_id[items[0]];
+//     // rhs_seq_id = get_read_id(items[5], sequences);
+//     rhs_seq_id = sequence_name_to_seq_id[items[5]];
+
+//     if (lhs_seq_id == (std::uint32_t )-1 || rhs_seq_id == (std::uint32_t )-1) {
+//       continue;
+//     } else {
+//       biosoup::Overlap overlap{ lhs_seq_id, (std::uint32_t)std::stoi(items[2]), (std::uint32_t)std::stoi(items[3]),
+//                                 rhs_seq_id, (std::uint32_t)std::stoi(items[7]), (std::uint32_t)std::stoi(items[8]),
+//                                 255, items[4] == "+" ? true : false};
+//       edlib_align tmp = {};
+//       extended_overlap total_ovlp{ overlap, tmp, 0, 0 };
+//       total_ovlp.correction_overlap = true;
+//       extended_overlaps[lhs_seq_id].emplace_back(total_ovlp);
+//     }
+//   }
+//   std::cerr << "[raven::LoadAndAlign] loaded overlaps from: " << param.input_paf_path << std::endl;
+
+//   auto resolve_alignments = [&](std::uint32_t i) -> void {
+//     std::string lhs_full = sequences[i]->InflateData();
+//     for (auto& overlap : extended_overlaps[i]) {
+//       std::string lhs = lhs_full.substr(
+//           overlap.overlap.lhs_begin,
+//           overlap.overlap.lhs_end - overlap.overlap.lhs_begin);
+
+//       biosoup::NucleicAcid rhs_{ "",
+//                                 sequences[overlap.overlap.rhs_id]->InflateData(
+//                                     overlap.overlap.rhs_begin,
+//                                     overlap.overlap.rhs_end - overlap.overlap.rhs_begin) };
+
+//       if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+
+//       auto rhs = rhs_.InflateData();
+
+//       overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
+//     }
+//   };
+
+//   std::vector<std::future<void>> alignment_futures;
+//   alignment_futures.reserve(sequences.size());
+//   for (std::uint32_t i = 0; i < sequences.size(); ++i) {
+//     alignment_futures.emplace_back(thread_pool_->Submit(resolve_alignments, i));
+//   }
+//   for (const auto& it : alignment_futures) {
+//     it.wait();
+//   }
+// };
+
+void Graph_Constructor::LoadOverlapsAndAlign(
+    Program_Parameters &param,
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+    std::vector<std::vector<extended_overlap>> &extended_overlaps) {
+
+  // const std::string overlaps_path =
+  //     param.input_paf_path;
+
+  std::ifstream file("/storage4/ftomas/jabba_trans/overlaps_features_fix_chr18/selected_top30_per_window.paf");
+
+  if (!file.is_open()) {
+    throw std::runtime_error(
+        "Error opening file: ");
+  }
+
+
+  // ========================================================================
+  // READ NAME -> SEQUENCE ID
+  // ========================================================================
+
+  std::map<std::string, std::uint32_t>
+      sequence_name_to_seq_id;
+
+  for (std::uint32_t i = 0;
+       i < sequences.size();
+       ++i) {
+
+    sequence_name_to_seq_id[
+        sequences[i]->name
+    ] = sequences[i]->id;
+  }
+
+
+  std::cerr
+      << "[raven::LoadAndAlign] loading overlaps from: "
+      << std::endl;
+
+
+  // ========================================================================
+  // LOAD PAF
+  //
+  // Input PAF orientation:
+  //
+  //   query  = supporting read
+  //   target = backbone/read being corrected
+  //
+  // Internal orientation:
+  //
+  //   lhs = backbone
+  //   rhs = support
+  // ========================================================================
+
+  std::string line;
+
+  std::uint64_t loaded = 0;
+  std::uint64_t skipped_load = 0;
+
+
+  while (std::getline(file, line)) {
+
+    if (line.empty()) {
+      continue;
+    }
+
+
+    std::istringstream iss(line);
+
+    std::string item;
+    std::vector<std::string> items;
+
+
+    while (std::getline(
+        iss,
+        item,
+        '\t')) {
+
+      items.emplace_back(
+          std::move(item));
+    }
+
+
+    // Mandatory PAF fields.
+    if (items.size() < 12) {
+
+      ++skipped_load;
+      continue;
+    }
+
+
+    // ----------------------------------------------------------------------
+    // PAF target -> lhs / backbone
+    // ----------------------------------------------------------------------
+
+    const auto lhs_it =
+        sequence_name_to_seq_id.find(
+            items[5]);
+
+
+    // ----------------------------------------------------------------------
+    // PAF query -> rhs / supporting read
+    // ----------------------------------------------------------------------
+
+    const auto rhs_it =
+        sequence_name_to_seq_id.find(
+            items[0]);
+
+
+    if (lhs_it ==
+            sequence_name_to_seq_id.end() ||
+        rhs_it ==
+            sequence_name_to_seq_id.end()) {
+
+      ++skipped_load;
+      continue;
+    }
+
+
+    const std::uint32_t lhs_seq_id =
+        lhs_it->second;
+
+    const std::uint32_t rhs_seq_id =
+        rhs_it->second;
+
+
+    // ----------------------------------------------------------------------
+    // Coordinates
+    //
+    // PAF target coordinates -> lhs/backbone
+    // PAF query coordinates  -> rhs/support
+    //
+    // These remain forward-coordinate intervals even for '-' overlaps.
+    // ----------------------------------------------------------------------
+
+    const std::uint32_t lhs_begin =
+        static_cast<std::uint32_t>(
+            std::stoul(items[7]));
+
+    const std::uint32_t lhs_end =
+        static_cast<std::uint32_t>(
+            std::stoul(items[8]));
+
+
+    const std::uint32_t rhs_begin =
+        static_cast<std::uint32_t>(
+            std::stoul(items[2]));
+
+    const std::uint32_t rhs_end =
+        static_cast<std::uint32_t>(
+            std::stoul(items[3]));
+
+
+    const bool strand =
+        items[4] == "+";
+
+
+    // ----------------------------------------------------------------------
+    // Validate coordinates
+    // ----------------------------------------------------------------------
+
+    if (lhs_end <= lhs_begin ||
+        rhs_end <= rhs_begin ||
+        lhs_end >
+            sequences[lhs_seq_id]->inflated_len ||
+        rhs_end >
+            sequences[rhs_seq_id]->inflated_len) {
+
+      ++skipped_load;
+      continue;
+    }
+
+
+    biosoup::Overlap overlap{
+        lhs_seq_id,
+        lhs_begin,
+        lhs_end,
+
+        rhs_seq_id,
+        rhs_begin,
+        rhs_end,
+
+        255,
+        strand
+    };
+
+
+    edlib_align tmp = {};
+
+
+    extended_overlap total_ovlp{
+        overlap,
+        tmp,
+        0,
+        0
+    };
+
+
+    // Alignment has not been calculated yet.
+    total_ovlp.correction_overlap =
+        false;
+
+
+    // Keep original input coordinates around if these fields are used
+    // elsewhere.
+    total_ovlp.lhs_begin_original =
+        lhs_begin;
+
+    total_ovlp.lhs_end_original =
+        lhs_end;
+
+    total_ovlp.rhs_begin_original =
+        rhs_begin;
+
+    total_ovlp.rhs_end_original =
+        rhs_end;
+
+
+    extended_overlaps[
+        lhs_seq_id
+    ].emplace_back(
+        std::move(total_ovlp));
+
+
+    ++loaded;
+  }
+
+
+  file.close();
+
+
+  std::cerr
+      << "[raven::LoadAndAlign] loaded "
+      << loaded
+      << " overlaps, skipped "
+      << skipped_load
+      << std::endl;
+
+  AlignCorrectionOverlaps(sequences, extended_overlaps);
+}
+
+void Graph_Constructor::AlignCorrectionOverlaps(
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+    std::vector<std::vector<extended_overlap>> &extended_overlaps) {
+
+  // ========================================================================
+  // TRIM TERMINAL EDLIB GAPS
+  //
+  // Edlib orientation:
+  //
+  //   query  = lhs = backbone
+  //   target = rhs = support
+  //
+  // Therefore in the INTERNAL Edlib CIGAR:
+  //
+  //   I consumes lhs
+  //   D consumes rhs
+  //
+  //
+  // RHS orientation:
+  //
+  // '+' :
+  //
+  //   rhs_begin ----------------> rhs_end
+  //
+  // '-' :
+  //
+  //   rhs_begin <---------------- rhs_end
+  //
+  // because the extracted RHS interval is reverse-complemented.
+  // ========================================================================
+
+  auto trim_terminal_gaps =
+      [](extended_overlap &ovlp) -> bool {
+
+    auto &alignment =
+        ovlp.edlib_alignment;
+
+    auto &overlap =
+        ovlp.overlap;
+
+
+    if (alignment.cigar.empty()) {
+      return false;
+    }
+
+
+    // ======================================================================
+    // PARSE CIGAR
+    // ======================================================================
+
+    std::vector<
+        std::pair<std::uint32_t, char>
+    > ops;
+
+
+    std::uint32_t num = 0;
+
+
+    for (char c :
+         alignment.cigar) {
+
+      if (std::isdigit(
+              static_cast<unsigned char>(c))) {
+
+        num =
+            num * 10 +
+            static_cast<std::uint32_t>(
+                c - '0');
+
+        continue;
+      }
+
+
+      if (num == 0) {
+        return false;
+      }
+
+
+      // Edlib standard CIGAR should contain only M/I/D.
+      if (c != 'M' &&
+          c != 'I' &&
+          c != 'D') {
+
+        return false;
+      }
+
+
+      ops.emplace_back(
+          num,
+          c);
+
+      num = 0;
+    }
+
+
+    if (ops.empty()) {
+      return false;
+    }
+
+
+    std::size_t lo = 0;
+    std::size_t hi = ops.size();
+
+
+    std::uint64_t removed_gap_bases = 0;
+
+
+    // ======================================================================
+    // REMOVE LEADING I/D
+    // ======================================================================
+
+    while (lo < hi &&
+           (ops[lo].second == 'I' ||
+            ops[lo].second == 'D')) {
+
+      const std::uint32_t len =
+          ops[lo].first;
+
+      const char op =
+          ops[lo].second;
+
+
+      if (op == 'I') {
+
+        // --------------------------------------------------------------
+        // Internal I consumes lhs/backbone.
+        //
+        // Leading lhs sequence corresponds to lhs_begin.
+        // --------------------------------------------------------------
+
+        if (len >
+            overlap.lhs_end -
+            overlap.lhs_begin) {
+
+          return false;
+        }
+
+
+        overlap.lhs_begin +=
+            len;
+
+
+      } else {
+
+        // --------------------------------------------------------------
+        // Internal D consumes rhs/support.
+        //
+        // '+':
+        //      leading RHS -> rhs_begin += len
+        //
+        // '-':
+        //      RHS was reverse-complemented.
+        //      Leading aligned sequence corresponds to the high
+        //      forward-coordinate end.
+        //
+        //      leading RHS -> rhs_end -= len
+        // --------------------------------------------------------------
+
+        if (len >
+            overlap.rhs_end -
+            overlap.rhs_begin) {
+
+          return false;
+        }
+
+
+        if (overlap.strand) {
+
+          overlap.rhs_begin +=
+              len;
+
+        } else {
+
+          overlap.rhs_end -=
+              len;
+        }
+      }
+
+
+      removed_gap_bases +=
+          len;
+
+      ++lo;
+    }
+
+
+    // ======================================================================
+    // REMOVE TRAILING I/D
+    // ======================================================================
+
+    while (hi > lo &&
+           (ops[hi - 1].second == 'I' ||
+            ops[hi - 1].second == 'D')) {
+
+      const std::uint32_t len =
+          ops[hi - 1].first;
+
+      const char op =
+          ops[hi - 1].second;
+
+
+      if (op == 'I') {
+
+        // --------------------------------------------------------------
+        // Internal I consumes lhs/backbone.
+        //
+        // Trailing lhs sequence corresponds to lhs_end.
+        // --------------------------------------------------------------
+
+        if (len >
+            overlap.lhs_end -
+            overlap.lhs_begin) {
+
+          return false;
+        }
+
+
+        overlap.lhs_end -=
+            len;
+
+
+      } else {
+
+        // --------------------------------------------------------------
+        // Internal D consumes rhs/support.
+        //
+        // '+':
+        //      trailing RHS -> rhs_end -= len
+        //
+        // '-':
+        //      trailing reverse-complemented RHS corresponds to the low
+        //      forward-coordinate end.
+        //
+        //      trailing RHS -> rhs_begin += len
+        // --------------------------------------------------------------
+
+        if (len >
+            overlap.rhs_end -
+            overlap.rhs_begin) {
+
+          return false;
+        }
+
+
+        if (overlap.strand) {
+
+          overlap.rhs_end -=
+              len;
+
+        } else {
+
+          overlap.rhs_begin +=
+              len;
+        }
+      }
+
+
+      removed_gap_bases +=
+          len;
+
+      --hi;
+    }
+
+
+    // ======================================================================
+    // VALIDATE REMAINING ALIGNMENT
+    // ======================================================================
+
+    if (lo >= hi) {
+      return false;
+    }
+
+
+    if (overlap.lhs_end <=
+            overlap.lhs_begin ||
+        overlap.rhs_end <=
+            overlap.rhs_begin) {
+
+      return false;
+    }
+
+
+    // After removing terminal gaps we expect the alignment to start
+    // and end with aligned sequence.
+    if (ops[lo].second != 'M' ||
+        ops[hi - 1].second != 'M') {
+
+      return false;
+    }
+
+
+    // ======================================================================
+    // RECONSTRUCT TRIMMED CIGAR
+    // ======================================================================
+
+    std::string trimmed_cigar;
+
+    trimmed_cigar.reserve(
+        alignment.cigar.size());
+
+
+    std::uint64_t new_block_length =
+        0;
+
+
+    for (std::size_t j = lo;
+         j < hi;
+         ++j) {
+
+      trimmed_cigar +=
+          std::to_string(
+              ops[j].first);
+
+      trimmed_cigar +=
+          ops[j].second;
+
+
+      // M, I and D all contribute alignment columns to the Edlib
+      // alignment/block length.
+      new_block_length +=
+          ops[j].first;
+    }
+
+
+    alignment.cigar =
+        std::move(
+            trimmed_cigar);
+
+
+    // ======================================================================
+    // UPDATE ALIGNMENT STATISTICS
+    // ======================================================================
+
+    alignment.block_length =
+        static_cast<decltype(
+            alignment.block_length)>(
+                new_block_length);
+
+
+    // Every terminal I/D base contributes exactly one edit.
+    if (removed_gap_bases >
+        static_cast<std::uint64_t>(
+            alignment.edit_distance)) {
+
+      return false;
+    }
+
+
+    alignment.edit_distance -=
+        static_cast<decltype(
+            alignment.edit_distance)>(
+                removed_gap_bases);
+
+
+    // alignment.matches does NOT change because only gaps were removed.
+
+
+    // ======================================================================
+    // SAVE EXACT COORDINATES CORRESPONDING TO THE TRIMMED CIGAR
+    // ======================================================================
+
+    ovlp.correction_lhs_begin =
+        overlap.lhs_begin;
+
+    ovlp.correction_lhs_end =
+        overlap.lhs_end;
+
+    ovlp.correction_rhs_begin =
+        overlap.rhs_begin;
+
+    ovlp.correction_rhs_end =
+        overlap.rhs_end;
+
+
+    return true;
+  };
+
+
+  // ========================================================================
+  // ALIGN EACH PILE
+  // ========================================================================
+
+  auto resolve_alignments =
+      [&](std::uint32_t i) -> void {
+
+
+    const std::string lhs_full =
+        sequences[i]->InflateData();
+
+
+    for (auto &overlap :
+         extended_overlaps[i]) {
+
+
+      const std::uint32_t rhs_id =
+          overlap.overlap.rhs_id;
+
+
+      // ====================================================================
+      // EXTRACT LHS / BACKBONE
+      // ====================================================================
+
+      const std::string lhs =
+          lhs_full.substr(
+              overlap.overlap.lhs_begin,
+              overlap.overlap.lhs_end -
+                  overlap.overlap.lhs_begin);
+
+
+      // ====================================================================
+      // EXTRACT RHS / SUPPORT
+      // ====================================================================
+
+      biosoup::NucleicAcid rhs_{
+          "",
+          sequences[rhs_id]->InflateData(
+              overlap.overlap.rhs_begin,
+              overlap.overlap.rhs_end -
+                  overlap.overlap.rhs_begin)
+      };
+
+
+      // PAF coordinates remain forward-coordinate intervals.
+      // Only the sequence itself is reverse-complemented.
+      if (!overlap.overlap.strand) {
+
+        rhs_.ReverseAndComplement();
+      }
+
+
+      const std::string rhs =
+          rhs_.InflateData();
+
+
+      if (lhs.empty() ||
+          rhs.empty()) {
+
+        overlap.correction_overlap =
+            false;
+
+        continue;
+      }
+
+
+      // ====================================================================
+      // GLOBAL EDLIB ALIGNMENT
+      // ====================================================================
+
+      overlap.edlib_alignment =
+          edlib_wrapper(
+              lhs,
+              rhs);
+
+
+      // ====================================================================
+      // REMOVE TERMINAL I/D
+      //
+      // This modifies both:
+      //
+      //   overlap.edlib_alignment.cigar
+      //
+      // and
+      //
+      //   overlap.overlap.{lhs,rhs}_{begin,end}
+      //
+      // so they describe exactly the same trimmed alignment.
+      // ====================================================================
+
+      if (!trim_terminal_gaps(
+              overlap)) {
+
+        overlap.correction_overlap =
+            false;
+
+        continue;
+      }
+
+
+      overlap.correction_overlap =
+          true;
     }
   };
 
-  std::vector<std::future<void>> alignment_futures;
-  alignment_futures.reserve(sequences.size());
-  for (std::uint32_t i = 0; i < sequences.size(); ++i) {
-    alignment_futures.emplace_back(thread_pool_->Submit(resolve_alignments, i));
+
+  // ========================================================================
+  // RUN ALIGNMENTS IN PARALLEL
+  // ========================================================================
+
+  std::vector<std::future<void>>
+      alignment_futures;
+
+
+  alignment_futures.reserve(
+      sequences.size());
+
+
+  for (std::uint32_t i = 0;
+       i < sequences.size();
+       ++i) {
+
+    alignment_futures.emplace_back(
+        thread_pool_->Submit(
+            resolve_alignments,
+            i));
   }
-  for (const auto& it : alignment_futures) {
+
+
+  for (const auto &it :
+       alignment_futures) {
+
     it.wait();
   }
-};
+
+
+  alignment_futures.clear();
+
+
+  // ========================================================================
+  // DIAGNOSTICS
+  // ========================================================================
+
+  std::uint64_t aligned = 0;
+  std::uint64_t rejected = 0;
+
+
+  for (const auto &pile :
+       extended_overlaps) {
+
+    for (const auto &overlap :
+         pile) {
+
+      if (overlap.correction_overlap) {
+
+        ++aligned;
+
+      } else {
+
+        ++rejected;
+      }
+    }
+  }
+
+
+  std::cerr
+      << "[raven::LoadAndAlign] successfully aligned/trimmed "
+      << aligned
+      << " overlaps, rejected "
+      << rejected
+      << std::endl;
+}
 
 void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                        std::vector<std::vector<extended_overlap>> &extended_overlaps,
@@ -406,10 +1401,20 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
 
-  graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_initial_overlaps_filename);
-  std::cerr << "[raven::Graph::Construct] initial overlaps printed"
-            << std::endl;
-  exit(0);
+  if (param.dump_all_overlaps) {
+    // Debug: raw ram overlaps (all fragments, no dedup/merge/features) are now
+    // in extended_overlaps[i] with read i as query. Dump and stop before any
+    // contained-read resolution or classification touches them.
+    std::cerr << "Dumping ALL raw overlaps (no dedup/merge/features) to "
+                 "all_overlaps.paf" << std::endl;
+    graph_.PrintAllRawOverlaps(extended_overlaps, sequences, "all_overlaps.paf");
+    return;
+  }
+
+  // graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_initial_overlaps_filename);
+  // std::cerr << "[raven::Graph::Construct] initial overlaps printed"
+  //           << std::endl;
+  // exit(0);
 
   ResolveContainedReads(sequences, extended_overlaps, timer, 3);
 
@@ -587,7 +1592,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     50};
   const std::string cnnont_path =
     //"/home/ftomas/github/draven/third_party/pytorch_model/CNNONT_model_multi_v1.int8.ts.pt";
-    "/mnt/share1_Jabba/ftomas/CNNONT_models/CNNONT_model_multi_uncapped.ts.pt";
+    "/storage4/ftomas/jabba_trans/CNNONT_model_multi_uncapped.ts.pt";
   // /home/ftomas/github/CNNONT/mlruns/4/f1546b13a1e645cfa8e5d9340c82894d/artifacts/checkpoints/cnnont_model_best.pth
   at::set_num_threads(1);
   at::set_num_interop_threads(1);
@@ -839,19 +1844,46 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       ovlps = minimizer_engine.Map(sequences[i], true, true,
                                                                 false);
     }
-    
+
+    if (param.dump_all_overlaps) {
+      // Debug: keep EVERY raw fragment ram found (no dedup, no merge, no
+      // feature extraction, no alignment) so raw ram coordinates can be
+      // compared against minimap2. Query is read i (lhs); coordinates are the
+      // raw anchor spans exactly as ram returned them.
+      std::vector<extended_overlap> raw;
+      raw.reserve(ovlps.size());
+      for (const auto &ovlp : ovlps) {
+        extended_overlap eo{ ovlp, {}, 0, 0 };
+        eo.lhs_begin_original = ovlp.lhs_begin;
+        eo.lhs_end_original   = ovlp.lhs_end;
+        eo.rhs_begin_original = ovlp.rhs_begin;
+        eo.rhs_end_original   = ovlp.rhs_end;
+        eo.found_matches      = ovlp.score;
+        eo.found_length       = std::max(ovlp.lhs_end - ovlp.lhs_begin,
+                                         ovlp.rhs_end - ovlp.rhs_begin);
+        raw.push_back(eo);
+      }
+      return raw;
+    }
+
     if (!ovlps.empty()) {
       std::vector<extended_overlap> ovlps_final;
       std::vector<extended_overlap> ovlps_tmp;
       std::vector<biosoup::Overlap> no_dups_overlaps;
       std::vector<std::vector<float>> features {};
         
-      std::sort(ovlps.begin(), ovlps.end(),
-          [&](const biosoup::Overlap &lhs,
-              const biosoup::Overlap &rhs) -> bool {
-            return overlap_length(lhs) > overlap_length(rhs);
-          });
-      no_dups_overlaps = remove_duplicates(ovlps);
+      if (param.merge_fragments) {
+        // Merge collinear fragments per pair -> outermost-anchor span.
+        no_dups_overlaps = merge_fragments(ovlps);
+      } else {
+        // Keep only the longest fragment per pair, then extrapolate it.
+        std::sort(ovlps.begin(), ovlps.end(),
+            [&](const biosoup::Overlap &lhs,
+                const biosoup::Overlap &rhs) -> bool {
+              return overlap_length(lhs) > overlap_length(rhs);
+            });
+        no_dups_overlaps = remove_duplicates(ovlps);
+      }
 
       std::vector<biosoup::Overlap> tmp;
 
@@ -1096,7 +2128,11 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         for (auto &it : thread_futures) {
           for (const auto &jt : it.get()) {
             extended_overlaps[jt.overlap.lhs_id].emplace_back(jt);
-            extended_overlaps[jt.overlap.rhs_id].emplace_back(feature_overlap_reverse(jt));
+            // In raw-dump mode keep each fragment once, oriented with read i
+            // (lhs) as query -- no reversed copy on the target pile.
+            if (!param.dump_all_overlaps) {
+              extended_overlaps[jt.overlap.rhs_id].emplace_back(feature_overlap_reverse(jt));
+            }
           }
         }
         thread_futures.clear();
@@ -1744,90 +2780,351 @@ void Graph_Constructor::ResolveChimericSequences(std::vector<std::unique_ptr<bio
             << std::endl;
 }
 
-void Graph_Constructor::AlignBackboneReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
-                                               std::vector<std::vector<extended_overlap>> &overlaps,
-                                               biosoup::Timer &timer,
-                                               Program_Parameters &param){
+// void Graph_Constructor::AlignBackboneReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+//                                                std::vector<std::vector<extended_overlap>> &overlaps,
+//                                                biosoup::Timer &timer,
+//                                                Program_Parameters &param){
 
-  auto resolve_alignments = [&](std::uint32_t i) -> void {
-    if(graph_.piles_[i]->is_backbone() && !graph_.piles_[i]->is_strong_contained()){
-      std::string lhs_full = sequences[i]->InflateData();
-      for(auto& overlap : overlaps[i]){
-        if(overlap.classification_label != 1){
-          // std::string lhs_full = sequences[i]->InflateData();
-          std::string lhs = lhs_full.substr(
-                            overlap.lhs_begin_original,
-                            overlap.lhs_end_original - overlap.lhs_begin_original);
-          // biosoup::NucleicAcid lhs_{ "",
-          //                           sequences[overlap.overlap.lhs_id]->InflateData(overlap.overlap.lhs_begin,
-          //                                                                     overlap.overlap.lhs_end - overlap.overlap.lhs_begin)};
-          biosoup::NucleicAcid rhs_{ "",
-                                    sequences[overlap.overlap.rhs_id]->InflateData(overlap.rhs_begin_original,
-                                                                              overlap.rhs_end_original - overlap.rhs_begin_original) };
+//   auto resolve_alignments = [&](std::uint32_t i) -> void {
+//     if(graph_.piles_[i]->is_backbone() && !graph_.piles_[i]->is_strong_contained()){
+//       std::string lhs_full = sequences[i]->InflateData();
+//       for(auto& overlap : overlaps[i]){
+//         if (param.infix_align) {
+//           // Infix (HW) alignment: align read i's raw anchor region as an infix
+//           // of a PADDED target window, and recover the exact target coordinates
+//           // from edlib -- robust to the anchor/extension coordinate imprecision.
+//           if (overlap.lhs_end_original <= overlap.lhs_begin_original) {
+//             continue;
+//           }
+//           std::string query = lhs_full.substr(
+//               overlap.lhs_begin_original,
+//               overlap.lhs_end_original - overlap.lhs_begin_original);
 
-          if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+//           const std::uint32_t margin =
+//               std::max<std::uint32_t>(500u, static_cast<std::uint32_t>(query.size()) / 20u);
+//           const std::uint32_t tlen = sequences[overlap.overlap.rhs_id]->inflated_len;
+//           const std::uint32_t w_start =
+//               overlap.rhs_begin_original > margin ? overlap.rhs_begin_original - margin : 0;
+//           const std::uint32_t w_end =
+//               std::min<std::uint32_t>(overlap.rhs_end_original + margin, tlen);
+//           if (w_end <= w_start) {
+//             continue;
+//           }
+//           const std::uint32_t wl = w_end - w_start;
 
-          auto rhs = rhs_.InflateData();
-      //    auto lhs = lhs_.InflateData();
-          overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
-          overlap.correction_overlap = true;
-        } else if(overlap.classification_label == 1){
-          std::string lhs = lhs_full.substr(
-                            overlap.overlap.lhs_begin,
-                            overlap.overlap.lhs_end - overlap.overlap.lhs_begin);
-          // biosoup::NucleicAcid lhs_{ "",
-          //                           sequences[overlap.overlap.lhs_id]->InflateData(overlap.overlap.lhs_begin,
-          //                                                                     overlap.overlap.lhs_end - overlap.overlap.lhs_begin)};
-          biosoup::NucleicAcid rhs_{ "",
-                                    sequences[overlap.overlap.rhs_id]->InflateData(overlap.overlap.rhs_begin,
-                                                                              overlap.overlap.rhs_end - overlap.overlap.rhs_begin) };
+//           biosoup::NucleicAcid tw{ "",
+//               sequences[overlap.overlap.rhs_id]->InflateData(w_start, wl) };
+//           if (!overlap.overlap.strand) tw.ReverseAndComplement();
+//           const std::string target_window = tw.InflateData();
 
-          if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+//           overlap.edlib_alignment = edlib_wrapper_infix(query, target_window);
 
-          auto rhs = rhs_.InflateData();
-      //    auto lhs = lhs_.InflateData();
-          overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
-          overlap.correction_overlap = true;        
-        } //else {
-        //   std::string lhs = lhs_full.substr(
-        //                     overlap.overlap.lhs_begin,
-        //                     overlap.overlap.lhs_end - overlap.overlap.lhs_begin);
-        //   biosoup::NucleicAcid rhs_{ "",
-        //                             sequences[overlap.overlap.rhs_id]->InflateData(overlap.overlap.rhs_begin,
-        //                                                                       overlap.overlap.rhs_end - overlap.overlap.rhs_begin) };
+//           // Recover exact target coords from the aligned infix [ts, te] (window
+//           // coordinates). For reverse overlaps the window was reverse-complemented,
+//           // so map positions back to the forward target.
+//           const std::int32_t ts = overlap.edlib_alignment.target_start;
+//           const std::int32_t te = overlap.edlib_alignment.target_end;
+//           if (overlap.overlap.strand) {
+//             overlap.rhs_begin_original = w_start + static_cast<std::uint32_t>(ts);
+//             overlap.rhs_end_original   = w_start + static_cast<std::uint32_t>(te) + 1;
+//           } else {
+//             overlap.rhs_begin_original = w_start + (wl - 1 - static_cast<std::uint32_t>(te));
+//             overlap.rhs_end_original   = w_start + (wl - 1 - static_cast<std::uint32_t>(ts)) + 1;
+//           }
+//           overlap.correction_overlap = true;
+//           continue;
+//         }
+//         if(overlap.classification_label != 1){
+//           // std::string lhs_full = sequences[i]->InflateData();
+//           std::string lhs = lhs_full.substr(
+//                             overlap.lhs_begin_original,
+//                             overlap.lhs_end_original - overlap.lhs_begin_original);
+//           // biosoup::NucleicAcid lhs_{ "",
+//           //                           sequences[overlap.overlap.lhs_id]->InflateData(overlap.overlap.lhs_begin,
+//           //                                                                     overlap.overlap.lhs_end - overlap.overlap.lhs_begin)};
+//           biosoup::NucleicAcid rhs_{ "",
+//                                     sequences[overlap.overlap.rhs_id]->InflateData(overlap.rhs_begin_original,
+//                                                                               overlap.rhs_end_original - overlap.rhs_begin_original) };
 
-        //   if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+//           if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
 
-        //   auto rhs = rhs_.InflateData();
-        //   // overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
-        //   overlap.correction_overlap = true;
-          // for(auto& rhs_overlap : overlaps[overlap.overlap.rhs_id]){
-          //   if(rhs_overlap.overlap.rhs_id == i){
-          //     rhs_overlap.edlib_alignment.cigar = cigar_alignment_reverse(overlap.edlib_alignment.cigar);
-          //     rhs_overlap.edlib_alignment.matches = overlap.edlib_alignment.matches;
-          //     rhs_overlap.edlib_alignment.block_length = overlap.edlib_alignment.block_length;
-          //     rhs_overlap.edlib_alignment.edit_distance = overlap.edlib_alignment.edit_distance;
-          //     rhs_overlap.correction_overlap = true;
-          //     break;
-          //   }
-          // }
-      //  }
+//           auto rhs = rhs_.InflateData();
+//       //    auto lhs = lhs_.InflateData();
+//           overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
+//           overlap.correction_overlap = true;
+//         } else if(overlap.classification_label == 1){
+//           std::string lhs = lhs_full.substr(
+//                             overlap.overlap.lhs_begin,
+//                             overlap.overlap.lhs_end - overlap.overlap.lhs_begin);
+//           // biosoup::NucleicAcid lhs_{ "",
+//           //                           sequences[overlap.overlap.lhs_id]->InflateData(overlap.overlap.lhs_begin,
+//           //                                                                     overlap.overlap.lhs_end - overlap.overlap.lhs_begin)};
+//           biosoup::NucleicAcid rhs_{ "",
+//                                     sequences[overlap.overlap.rhs_id]->InflateData(overlap.overlap.rhs_begin,
+//                                                                               overlap.overlap.rhs_end - overlap.overlap.rhs_begin) };
+
+//           if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+
+//           auto rhs = rhs_.InflateData();
+//       //    auto lhs = lhs_.InflateData();
+//           overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
+//           overlap.correction_overlap = true;        
+//         } //else {
+//         //   std::string lhs = lhs_full.substr(
+//         //                     overlap.overlap.lhs_begin,
+//         //                     overlap.overlap.lhs_end - overlap.overlap.lhs_begin);
+//         //   biosoup::NucleicAcid rhs_{ "",
+//         //                             sequences[overlap.overlap.rhs_id]->InflateData(overlap.overlap.rhs_begin,
+//         //                                                                       overlap.overlap.rhs_end - overlap.overlap.rhs_begin) };
+
+//         //   if (!overlap.overlap.strand) rhs_.ReverseAndComplement();
+
+//         //   auto rhs = rhs_.InflateData();
+//         //   // overlap.edlib_alignment = edlib_wrapper(lhs, rhs);
+//         //   overlap.correction_overlap = true;
+//           // for(auto& rhs_overlap : overlaps[overlap.overlap.rhs_id]){
+//           //   if(rhs_overlap.overlap.rhs_id == i){
+//           //     rhs_overlap.edlib_alignment.cigar = cigar_alignment_reverse(overlap.edlib_alignment.cigar);
+//           //     rhs_overlap.edlib_alignment.matches = overlap.edlib_alignment.matches;
+//           //     rhs_overlap.edlib_alignment.block_length = overlap.edlib_alignment.block_length;
+//           //     rhs_overlap.edlib_alignment.edit_distance = overlap.edlib_alignment.edit_distance;
+//           //     rhs_overlap.correction_overlap = true;
+//           //     break;
+//           //   }
+//           // }
+//       //  }
+//       }
+//     }
+//   };
+
+//   std::vector<std::future<void>> alignment_futures;
+//   for(int i = 0; i < sequences.size(); i++){
+//     alignment_futures.emplace_back(thread_pool_->Submit(resolve_alignments, i));
+//     //resolve_alignments(i);
+//   }
+
+//   for (const auto &it : alignment_futures) {
+//     it.wait();
+//   }
+  
+//   alignment_futures.clear();
+
+// }
+
+void Graph_Constructor::AlignBackboneReads(
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+    std::vector<std::vector<extended_overlap>> &overlaps,
+    biosoup::Timer &timer,
+    Program_Parameters &param) {
+
+  // Extra sequence given to NW around the geometrically estimated
+  // overlap boundaries.
+  constexpr std::uint32_t kNwPadding = 50;
+
+
+  auto resolve_alignments =
+      [&](std::uint32_t i) -> void {
+
+    // Only backbone reads are corrected/aligned.
+    if (!graph_.piles_[i]->is_backbone() ||
+        graph_.piles_[i]->is_strong_contained()) {
+
+      return;
+    }
+
+
+    const std::string lhs_full =
+        sequences[i]->InflateData();
+
+    const std::uint32_t lhs_len =
+        sequences[i]->inflated_len;
+
+
+    for (auto &overlap : overlaps[i]) {
+
+      const std::uint32_t rhs_id =
+          overlap.overlap.rhs_id;
+
+      const std::uint32_t rhs_len =
+          sequences[rhs_id]->inflated_len;
+
+
+      // ================================================================
+      // START FROM THE GEOMETRICALLY EXTENDED OVERLAP FOR ALL CLASSES
+      //
+      // classification_label no longer changes which coordinates are
+      // used for correction/alignment.
+      // ================================================================
+
+      std::uint32_t lhs_begin =
+          overlap.overlap.lhs_begin;
+
+      std::uint32_t lhs_end =
+          overlap.overlap.lhs_end;
+
+      std::uint32_t rhs_begin =
+          overlap.overlap.rhs_begin;
+
+      std::uint32_t rhs_end =
+          overlap.overlap.rhs_end;
+
+
+      // ================================================================
+      // VALIDATE ORIGINAL GEOMETRIC COORDINATES
+      // ================================================================
+
+      if (lhs_end <= lhs_begin ||
+          rhs_end <= rhs_begin ||
+          lhs_end > lhs_len ||
+          rhs_end > rhs_len) {
+
+        continue;
       }
+
+
+      // ================================================================
+      // ADD NW PADDING
+      //
+      // Give the global alignment some freedom around the geometrically
+      // predicted overlap endpoints.
+      //
+      // Coordinates are clamped to the physical read boundaries.
+      //
+      // In a normal dovetail overlap, geometric extension will already
+      // place one sequence at its physical end on each side. Therefore
+      // padding mostly gives extra sequence to the read which still has
+      // an overhang.
+      // ================================================================
+
+      lhs_begin =
+          lhs_begin > kNwPadding
+              ? lhs_begin - kNwPadding
+              : 0;
+
+      rhs_begin =
+          rhs_begin > kNwPadding
+              ? rhs_begin - kNwPadding
+              : 0;
+
+
+      lhs_end +=
+          std::min<std::uint32_t>(
+              kNwPadding,
+              lhs_len - lhs_end);
+
+      rhs_end +=
+          std::min<std::uint32_t>(
+              kNwPadding,
+              rhs_len - rhs_end);
+
+
+      // ================================================================
+      // EXTRACT THE EXACT SEQUENCES THAT WILL BE ALIGNED
+      // ================================================================
+
+      const std::string lhs =
+          lhs_full.substr(
+              lhs_begin,
+              lhs_end - lhs_begin);
+
+
+      biosoup::NucleicAcid rhs_{
+          "",
+          sequences[rhs_id]->InflateData(
+              rhs_begin,
+              rhs_end - rhs_begin)
+      };
+
+
+      // For reverse overlaps, align against the reverse complement of
+      // the selected forward-coordinate RHS interval.
+      if (!overlap.overlap.strand) {
+        rhs_.ReverseAndComplement();
+      }
+
+
+      const std::string rhs =
+          rhs_.InflateData();
+
+
+      if (lhs.empty() ||
+          rhs.empty()) {
+
+        continue;
+      }
+
+
+      // ================================================================
+      // CORRECTION COORDINATES
+      //
+      // IMPORTANT:
+      //
+      // These coordinates describe EXACTLY the substrings passed to
+      // Edlib below.
+      //
+      // PrintCorrectedOverlaps should therefore use correction_* when
+      // emitting the PAF coordinates alongside the resulting cg:Z CIGAR.
+      //
+      // Do NOT use overlap.overlap.* for the CIGAR-containing PAF,
+      // because those are the unpadded geometrical coordinates.
+      // ================================================================
+
+      overlap.correction_lhs_begin =
+          lhs_begin;
+
+      overlap.correction_lhs_end =
+          lhs_end;
+
+      overlap.correction_rhs_begin =
+          rhs_begin;
+
+      overlap.correction_rhs_end =
+          rhs_end;
+
+
+      // ================================================================
+      // FINAL GLOBAL ALIGNMENT
+      // ================================================================
+
+      overlap.edlib_alignment =
+          edlib_wrapper(
+              lhs,
+              rhs);
+
+
+      overlap.correction_overlap =
+          true;
     }
   };
 
-  std::vector<std::future<void>> alignment_futures;
-  for(int i = 0; i < sequences.size(); i++){
-    alignment_futures.emplace_back(thread_pool_->Submit(resolve_alignments, i));
-    //resolve_alignments(i);
+
+  // ====================================================================
+  // RUN BACKBONE ALIGNMENTS IN PARALLEL
+  // ====================================================================
+
+  std::vector<std::future<void>>
+      alignment_futures;
+
+
+  for (std::uint32_t i = 0;
+       i < sequences.size();
+       ++i) {
+
+    alignment_futures.emplace_back(
+        thread_pool_->Submit(
+            resolve_alignments,
+            i));
   }
 
-  for (const auto &it : alignment_futures) {
+
+  for (const auto &it :
+       alignment_futures) {
+
     it.wait();
   }
-  
-  alignment_futures.clear();
 
+
+  alignment_futures.clear();
 }
 
 void Graph_Constructor::ConstructAssemblyGraphInPhases(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,

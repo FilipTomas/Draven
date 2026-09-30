@@ -205,7 +205,7 @@ namespace raven {
       backbone_pile_ = true;
     }
 
-    bool is_backbone(){
+    bool is_backbone() const {
       return backbone_pile_;
     }
 
@@ -213,7 +213,7 @@ namespace raven {
       strong_contained_ = true;
     }
 
-    bool is_strong_contained(){
+    bool is_strong_contained() const {
       return strong_contained_;
     }
 

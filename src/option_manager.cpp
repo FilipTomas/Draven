@@ -37,6 +37,15 @@ enum program_opt {
   opt_internal_count,
   opt_bloom_gb,
   opt_store_kmer_ids,
+  opt_merge_fragments,
+  opt_infix_align,
+  opt_dump_overlaps_only,
+  opt_dump_all_overlaps,
+  opt_rf_model,
+  opt_rf_window_size,
+  opt_rf_top_k,
+  opt_rf_any_overlap,
+  opt_dump_rf_scores,
   opt_fastk_counts,
   opt_threads,
 
@@ -85,6 +94,15 @@ static struct option options[] = {
     {"internal-count", no_argument, nullptr, opt_internal_count},
     {"bloom-gb", required_argument, nullptr, opt_bloom_gb},
     {"store-kmer-ids", no_argument, nullptr, opt_store_kmer_ids},
+    {"merge-fragments", no_argument, nullptr, opt_merge_fragments},
+    {"infix-align", no_argument, nullptr, opt_infix_align},
+    {"dump-overlaps-only", no_argument, nullptr, opt_dump_overlaps_only},
+    {"dump-all-overlaps", no_argument, nullptr, opt_dump_all_overlaps},
+    {"rf-model", required_argument, nullptr, opt_rf_model},
+    {"rf-window-size", required_argument, nullptr, opt_rf_window_size},
+    {"rf-top-k", required_argument, nullptr, opt_rf_top_k},
+    {"rf-any-overlap", no_argument, nullptr, opt_rf_any_overlap},
+    {"dump-rf-scores", no_argument, nullptr, opt_dump_rf_scores},
     {"fastk-counts", required_argument, nullptr, opt_fastk_counts},
     {"threads", required_argument, nullptr, opt_threads},
 
@@ -196,6 +214,44 @@ void Help() {
             "      default: false\n"
             "      store per-position k-mer ids on each pile (faster Jaccard, more\n"
             "      memory) instead of recomputing them on demand\n"
+            "    --merge-fragments\n"
+            "      default: false\n"
+            "      merge collinear overlap fragments per read pair (span the\n"
+            "      outermost anchors) instead of keeping only the longest fragment\n"
+            "      and extrapolating it -- more accurate coordinates for error-rich\n"
+            "      reads\n"
+            "    --infix-align\n"
+            "      default: false\n"
+            "      align correction overlaps with edlib infix (HW) on a padded\n"
+            "      target window and recover exact target coordinates from the\n"
+            "      alignment, instead of global (NW) on fixed seed coordinates\n"
+            "    --dump-overlaps-only\n"
+            "      default: false\n"
+            "      dump pre-alignment backbone correction overlaps with features\n"
+            "      and stop, skipping the alignment step (debugging)\n"
+            "    --dump-all-overlaps\n"
+            "      default: false\n"
+            "      dump EVERY raw ram overlap fragment (no dedup/merge/features/\n"
+            "      alignment) to all_overlaps.paf and stop -- for comparing raw\n"
+            "      ram coordinates against minimap2 (debugging)\n"
+            "    --rf-model <string>\n"
+            "      random forest exported with scripts/export_rf_model.py; compute,\n"
+            "      score and select correction overlaps in-process (top-K per\n"
+            "      target window) instead of loading a selected PAF\n"
+            "    --rf-window-size <int>\n"
+            "      default: 4096\n"
+            "      target window size for --rf-model selection\n"
+            "    --rf-top-k <int>\n"
+            "      default: 30\n"
+            "      overlaps kept per target window for --rf-model selection\n"
+            "    --rf-any-overlap\n"
+            "      default: false\n"
+            "      any overlap touching a window is eligible, instead of only\n"
+            "      those spanning the whole window\n"
+            "    --dump-rf-scores\n"
+            "      default: false\n"
+            "      write every candidate's probability and selection to\n"
+            "      rf_selection.tsv\n"
             "    --fastk-counts <string>\n"
             "      path to the precomputed FastK counts (used when --internal-count\n"
             "      is off); build FastK on the same reads for an apples-to-apples\n"
@@ -367,6 +423,33 @@ int ProcessParameters(int argc, char **argv, Program_Parameters& param) {
         break;
       case opt_store_kmer_ids:
         param.store_kmer_ids = true;
+        break;
+      case opt_merge_fragments:
+        param.merge_fragments = true;
+        break;
+      case opt_infix_align:
+        param.infix_align = true;
+        break;
+      case opt_dump_overlaps_only:
+        param.dump_overlaps_only = true;
+        break;
+      case opt_dump_all_overlaps:
+        param.dump_all_overlaps = true;
+        break;
+      case opt_rf_model:
+        param.rf_model_path = optarg;
+        break;
+      case opt_rf_window_size:
+        param.rf_window_size = std::atoi(optarg);
+        break;
+      case opt_rf_top_k:
+        param.rf_top_k = std::atoi(optarg);
+        break;
+      case opt_rf_any_overlap:
+        param.rf_require_full_window = false;
+        break;
+      case opt_dump_rf_scores:
+        param.dump_rf_scores = true;
         break;
       case opt_fastk_counts:
         param.fastk_path = optarg;

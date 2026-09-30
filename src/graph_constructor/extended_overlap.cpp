@@ -29,6 +29,11 @@
       std::uint32_t rhs_begin_original;
       std::uint32_t rhs_end_original;
 
+      std::uint32_t correction_lhs_begin = 0;
+      std::uint32_t correction_lhs_end   = 0;
+      std::uint32_t correction_rhs_begin = 0;
+      std::uint32_t correction_rhs_end   = 0;
+
       float lhs_hap = 0.0;
       float rhs_hap = 0.0;
 

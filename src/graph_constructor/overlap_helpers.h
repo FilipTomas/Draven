@@ -135,8 +135,8 @@ inline extended_overlap feature_overlap_reverse(const extended_overlap &eo) {
   res.found_to_extended_length = eo.found_to_extended_length;
   res.hap_ratio = eo.hap_ratio;
   res.jaccard_index = eo.jaccard_index;
-  res.q_hor = eo.q_hor;
-  res.t_hor = eo.t_hor;
+  res.q_hor = eo.t_hor;
+  res.t_hor = eo.q_hor;
   res.classification_label = eo.classification_label;
   res.diploid_jaccard_longer = eo.diploid_jaccard_longer;
   res.diploid_jaccard_shorter = eo.diploid_jaccard_shorter;

@@ -95,6 +95,25 @@ namespace raven {
       const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
       const std::string& path) const;
 
+    // Print the correction overlaps (those belonging to backbone, non
+    // strong-contained reads) with the full feature columns of PrintOverlaps,
+    // BEFORE alignment -- so the correction overlap set + features can be
+    // inspected without paying for the alignment step. The edlib columns
+    // (matches/block_length) are unset at this stage.
+    void PrintBackboneOverlapsWithFeatures(
+      const std::vector<std::vector<extended_overlap>>& overlaps,
+      const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
+      const std::string& path) const;
+
+    // Print EVERY raw ram overlap fragment (no dedup, no merge, no features, no
+    // alignment) in PAF layout, using the raw anchor coordinates as ram
+    // returned them. Read i is the query (lhs). Used to compare raw ram
+    // coordinates against minimap2 (debugging).
+    void PrintAllRawOverlaps(
+      const std::vector<std::vector<extended_overlap>>& overlaps,
+      const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
+      const std::string& path) const;
+
     // draw unitig graph with Bandage
     void PrintUnitigGfa(const std::string &path, const bool print_seq) const;
 

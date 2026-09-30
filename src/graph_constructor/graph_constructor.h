@@ -92,6 +92,11 @@ private:
                            Program_Parameters &param);
 
   void LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps);
+  void AlignCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+                               std::vector<std::vector<extended_overlap>> &extended_overlaps);
+  void SelectCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
+                                std::vector<std::vector<extended_overlap>> &extended_overlaps,
+                                Program_Parameters &param);
   void MapSequences(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                     std::vector<std::vector<extended_overlap>> &extended_overlaps,
                     biosoup::Timer &timer,

@@ -49,6 +49,52 @@ edlib_align edlib_wrapper(
   }
 }
 
+// Infix (HW) alignment: align `query` fully as an infix of `target`; the
+// target's unaligned prefix/suffix are free. Returns the cigar of query vs the
+// matched infix, plus that infix's [target_start, target_end] (inclusive)
+// within `target`, so the caller can recover the exact target coordinates
+// regardless of imprecision in the seed region it padded.
+inline edlib_align edlib_wrapper_infix(
+  const std::string &query,
+  const std::string &target) {
+
+  edlib_align alignment_result;
+
+  EdlibAlignResult result = edlibAlign(
+    query.c_str(), query.size(),
+    target.c_str(), target.size(),
+    edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_PATH, nullptr, 0));
+
+  if (result.status == EDLIB_STATUS_OK) {
+    alignment_result.cigar = edlibAlignmentToCigar(result.alignment, result.alignmentLength, EDLIB_CIGAR_STANDARD);
+    alignment_result.edit_distance = result.editDistance;
+    alignment_result.block_length = result.alignmentLength;
+    alignment_result.matches = 0;
+    for (int i = 0; i < result.alignmentLength; i++) {
+      if (result.alignment[i] == 0) {
+        ++alignment_result.matches;
+      }
+    }
+    alignment_result.target_end =
+        (result.numLocations > 0 && result.endLocations != nullptr)
+            ? result.endLocations[0]
+            : static_cast<std::int32_t>(target.size()) - 1;
+    alignment_result.target_start =
+        (result.numLocations > 0 && result.startLocations != nullptr)
+            ? result.startLocations[0]
+            : 0;
+    edlibFreeAlignResult(result);
+    return alignment_result;
+  } else {
+    edlibFreeAlignResult(result);
+    alignment_result.cigar = "";
+    alignment_result.matches = 0;
+    alignment_result.edit_distance = -1;
+    alignment_result.block_length = 0;
+    return alignment_result;
+  }
+}
+
 void find_pairwise_alignment(std::uint32_t i,
                              std::vector<extended_overlap> &ovlps,
                              std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,

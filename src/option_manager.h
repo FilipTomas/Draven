@@ -30,6 +30,29 @@ struct Program_Parameters {
   // store per-position k-mer ids on each pile (faster Jaccard, more memory)
   // instead of recomputing them on demand (default: recompute)
   bool store_kmer_ids = false;
+  // merge collinear overlap fragments per pair (outermost-anchor span) instead
+  // of keeping only the longest fragment and extrapolating it (default: longest)
+  bool merge_fragments = false;
+  // align correction overlaps with edlib infix (HW) on a padded target window
+  // and recover exact target coords, instead of global (NW) on fixed coords
+  bool infix_align = false;
+  // dump pre-alignment backbone correction overlaps (with features) and stop,
+  // skipping the alignment step (debugging)
+  bool dump_overlaps_only = false;
+  // dump EVERY raw ram overlap fragment (no dedup, no merge, no features, no
+  // alignment) to all_overlaps.paf and stop -- for comparing raw ram
+  // coordinates against minimap2 (debugging)
+  bool dump_all_overlaps = false;
+  // random forest exported by scripts/export_rf_model.py; when set, correction
+  // overlaps are computed, scored and selected in-process (top rf_top_k per
+  // rf_window_size target window) instead of loading a selected PAF
+  std::string rf_model_path = "";
+  std::uint32_t rf_window_size = 4096;
+  std::uint32_t rf_top_k = 30;
+  // overlap must span the whole window to be eligible (else: touch it)
+  bool rf_require_full_window = true;
+  // write every candidate's probability and selection to rf_selection.tsv
+  bool dump_rf_scores = false;
   // path to the precomputed FastK counts (used when --internal-count is off)
   std::string fastk_path = "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19";
 
