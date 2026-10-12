@@ -156,6 +156,15 @@ inline extended_overlap feature_overlap_reverse(const extended_overlap &eo) {
   res.err_rate_longer_overhang_rhs = eo.err_rate_longer_overhang_lhs;
   res.err_rate_shorter_overhang_lhs = eo.err_rate_shorter_overhang_rhs;
   res.err_rate_shorter_overhang_rhs = eo.err_rate_shorter_overhang_lhs;
+  // swap sides; on '-' the old rhs decreases as lhs increases, so reverse
+  // to keep the new lhs increasing
+  res.anchors.reserve(eo.anchors.size());
+  for (const auto &a : eo.anchors) {
+    res.anchors.emplace_back(a.second, a.first);
+  }
+  if (!eo.overlap.strand) {
+    std::reverse(res.anchors.begin(), res.anchors.end());
+  }
   return res;
 }
 

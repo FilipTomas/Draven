@@ -94,8 +94,7 @@ int main(int argc, char **argv) {
   }
   else if(param.correction_overlaps) {
     std::cout << "Constructing correction overlaps!" << std::endl;
-    graph_constructor.ConstructCorrectionOverlaps(sequences, param);
-    return 1;
+    graph_constructor.ConstructCorrectionOverlaps(sequences, param);  // exits
   } else if (param.load_input_gfa) {
     graph_constructor.LoadFromGfa(param.input_gfa_path);
   } else if (param.load_input_paf) {

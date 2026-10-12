@@ -35,7 +35,9 @@ public:
     Program_Parameters &param,
     std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences);
   
-  void ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,  // NOLINT
+  // Writes correction.paf (or the --dump-* debug output) and ends the process
+  // with exit status 0 without running destructors.
+  [[noreturn]] void ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,  // NOLINT
     Program_Parameters &param);
 
   void LoadFromGfa(const std::string &gfa_path);
@@ -93,7 +95,9 @@ private:
 
   void LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps);
   void AlignCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
-                               std::vector<std::vector<extended_overlap>> &extended_overlaps);
+                               std::vector<std::vector<extended_overlap>> &extended_overlaps,
+                               std::uint32_t kmer_len,
+                               double max_edit_rate);
   void SelectCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                 std::vector<std::vector<extended_overlap>> &extended_overlaps,
                                 Program_Parameters &param);

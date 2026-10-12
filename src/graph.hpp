@@ -85,10 +85,12 @@ namespace raven {
                        std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, bool print_cigar,
                        const std::string &path) const;
 
+    // Pile formatting runs on thread_pool when one is given.
     void PrintCorrectionOverlaps(
       const std::vector<std::vector<extended_overlap>>& overlaps,
       const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
-      const std::string& path) const;
+      const std::string& path,
+      std::shared_ptr<thread_pool::ThreadPool> thread_pool = nullptr) const;
 
   void PrintCorrectionOverlapsWithFeatures(
       const std::vector<std::vector<extended_overlap>>& overlaps,

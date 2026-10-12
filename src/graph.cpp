@@ -2,6 +2,7 @@
 
 #include "graph.hpp"
 
+#include <deque>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -12,6 +13,7 @@
 
 #include "cereal/archives/binary.hpp"
 #include "cereal/archives/json.hpp"
+#include "biosoup/timer.hpp"
 #include "marked_edge.h"
 #include "graph_constructor/extended_overlap.h"
 
@@ -762,7 +764,8 @@ namespace raven {
 void Graph::PrintCorrectionOverlaps(
     const std::vector<std::vector<extended_overlap>>& overlaps,
     const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
-    const std::string& path) const {
+    const std::string& path,
+    std::shared_ptr<thread_pool::ThreadPool> thread_pool) const {
 
   if (path.empty()) {
     return;
@@ -848,9 +851,12 @@ void Graph::PrintCorrectionOverlaps(
   };
 
 
-  std::ofstream os(path);
+  biosoup::Timer timer{};
+  timer.Start();
 
-  if (!os) {
+  std::ofstream out(path);
+
+  if (!out) {
 
     std::cerr
         << "Could not open correction overlap file: "
@@ -861,13 +867,24 @@ void Graph::PrintCorrectionOverlaps(
   }
 
 
-  std::uint64_t written = 0;
-  std::uint64_t skipped = 0;
+  // One pile's PAF lines and warnings, formatted off the main thread.
+  struct PileText {
+    std::string paf;
+    std::string log;
+    std::uint64_t written = 0;
+    std::uint64_t skipped = 0;
+  };
 
 
-  for (const auto& pile : overlaps) {
+  auto format_pile = [&](std::size_t pile_id) -> PileText {
 
-    for (const auto& jt : pile) {
+    PileText result;
+    std::ostringstream os;
+    std::ostringstream log;
+    std::uint64_t& written = result.written;
+    std::uint64_t& skipped = result.skipped;
+
+    for (const auto& jt : overlaps[pile_id]) {
 
 
       // ====================================================================
@@ -921,7 +938,7 @@ void Graph::PrintCorrectionOverlaps(
           qe > qlen ||
           te > tlen) {
 
-        std::cerr
+        log
             << "Invalid correction overlap coordinates:"
             << " qs=" << qs
             << " qe=" << qe
@@ -977,7 +994,7 @@ void Graph::PrintCorrectionOverlaps(
            last_op != '=' &&
            last_op != 'X')) {
 
-        std::cerr
+        log
             << "Terminal gap survived trimming:"
             << "\n  query  = "
             << sequences[jt.overlap.rhs_id]->name
@@ -1045,7 +1062,7 @@ void Graph::PrintCorrectionOverlaps(
 
         } else {
 
-          std::cerr
+          log
               << "Unexpected CIGAR operation: "
               << c
               << std::endl;
@@ -1071,7 +1088,7 @@ void Graph::PrintCorrectionOverlaps(
       if (cigar_query_consumed != query_span ||
           cigar_target_consumed != target_span) {
 
-        std::cerr
+        log
             << "CIGAR/PAF span mismatch:"
             << "\n  query span      = "
             << query_span
@@ -1159,10 +1176,44 @@ void Graph::PrintCorrectionOverlaps(
 
       ++written;
     }
+
+    result.paf = os.str();
+    result.log = log.str();
+    return result;
+  };
+
+
+  std::uint64_t written = 0;
+  std::uint64_t skipped = 0;
+
+  auto emit = [&](PileText&& text) {
+    out << text.paf;
+    std::cerr << text.log;
+    written += text.written;
+    skipped += text.skipped;
+  };
+
+  if (thread_pool == nullptr) {
+    for (std::size_t i = 0; i < overlaps.size(); ++i) {
+      emit(format_pile(i));
+    }
+  } else {
+    // Formatted in parallel but written in pile order, so the file is the
+    // same as a serial write; a bounded window of piles is held at once.
+    const std::size_t window = 4 * thread_pool->num_threads();
+    std::deque<std::future<PileText>> pending;
+    std::size_t next = 0;
+    while (next < overlaps.size() || !pending.empty()) {
+      while (next < overlaps.size() && pending.size() < window) {
+        pending.emplace_back(thread_pool->Submit(format_pile, next++));
+      }
+      emit(pending.front().get());
+      pending.pop_front();
+    }
   }
 
 
-  os.close();
+  out.close();
 
 
   std::cerr
@@ -1170,6 +1221,8 @@ void Graph::PrintCorrectionOverlaps(
       << written
       << " overlaps, skipped "
       << skipped
+      << " "
+      << std::fixed << timer.Stop() << "s"
       << std::endl;
 }
 /*

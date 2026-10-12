@@ -46,6 +46,8 @@ enum program_opt {
   opt_rf_top_k,
   opt_rf_any_overlap,
   opt_dump_rf_scores,
+  opt_anchor_spacing,
+  opt_max_edit_rate,
   opt_fastk_counts,
   opt_threads,
 
@@ -103,6 +105,8 @@ static struct option options[] = {
     {"rf-top-k", required_argument, nullptr, opt_rf_top_k},
     {"rf-any-overlap", no_argument, nullptr, opt_rf_any_overlap},
     {"dump-rf-scores", no_argument, nullptr, opt_dump_rf_scores},
+    {"anchor-spacing", required_argument, nullptr, opt_anchor_spacing},
+    {"max-edit-rate", required_argument, nullptr, opt_max_edit_rate},
     {"fastk-counts", required_argument, nullptr, opt_fastk_counts},
     {"threads", required_argument, nullptr, opt_threads},
 
@@ -252,6 +256,15 @@ void Help() {
             "      default: false\n"
             "      write every candidate's probability and selection to\n"
             "      rf_selection.tsv\n"
+            "    --anchor-spacing <int>\n"
+            "      default: 500\n"
+            "      align correction overlaps piecewise between minimizer anchors\n"
+            "      kept about this many bp apart; 0 aligns each overlap globally\n"
+            "      in one piece\n"
+            "    --max-edit-rate <float>\n"
+            "      default: 0.3\n"
+            "      reject a correction overlap once its edit distance exceeds this\n"
+            "      fraction of its length; 0 aligns every overlap in full\n"
             "    --fastk-counts <string>\n"
             "      path to the precomputed FastK counts (used when --internal-count\n"
             "      is off); build FastK on the same reads for an apples-to-apples\n"
@@ -450,6 +463,12 @@ int ProcessParameters(int argc, char **argv, Program_Parameters& param) {
         break;
       case opt_dump_rf_scores:
         param.dump_rf_scores = true;
+        break;
+      case opt_anchor_spacing:
+        param.anchor_spacing = std::atoi(optarg);
+        break;
+      case opt_max_edit_rate:
+        param.max_edit_rate = std::atof(optarg);
         break;
       case opt_fastk_counts:
         param.fastk_path = optarg;

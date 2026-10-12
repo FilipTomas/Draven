@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -222,6 +223,133 @@ merge_fragments(std::vector<biosoup::Overlap> ovlps) {
     return merged;
 }
 
+// Anchors for aligning `kept` (the one overlap kept for a read pair)
+// piecewise. The pair's chain is often split into several fragments, so start
+// from the longest fragment inside `kept` and walk outwards along lhs, taking
+// fragments that continue its diagonal; the anchors then also cover the parts
+// `kept` was extrapolated over. The union is reduced to a strictly collinear
+// chain with anchors at least `spacing` apart.
+//
+// Every anchor pins the alignment path, so one exact k-mer match from another
+// repeat copy (e.g. a HOR period away) forces a detour that full NW would not
+// take. Diagonal shifts are therefore only allowed at the rate indel drift
+// produces (~1/8 of the distance), and anchors off their neighbours' median
+// diagonal are dropped.
+std::vector<std::pair<std::uint32_t, std::uint32_t>> collect_anchors(
+    const biosoup::Overlap &kept,
+    const std::vector<biosoup::Overlap> &fragments,
+    const std::vector<ram::MinimizerEngine::Anchors> &fragment_anchors,
+    std::uint32_t spacing) {
+    using Anchor = std::pair<std::uint32_t, std::uint32_t>;
+    const bool fwd = kept.strand;
+    // fwd chains keep rhs - lhs ~constant, reverse chains keep rhs + lhs
+    auto diagonal = [&](const Anchor& a) -> std::int64_t {
+        return fwd
+            ? static_cast<std::int64_t>(a.second) - static_cast<std::int64_t>(a.first)
+            : static_cast<std::int64_t>(a.second) + static_cast<std::int64_t>(a.first);
+    };
+    // largest diagonal shift plausible from indel drift over `distance` bp
+    auto max_drift = [](std::int64_t distance) -> std::int64_t {
+        return 32 + distance / 8;
+    };
+    // fragments are joined across ram's chain gaps, allow a little more
+    auto continues = [&](const Anchor& from, const Anchor& to) -> bool {
+        const std::int64_t distance = static_cast<std::int64_t>(to.first) - from.first;
+        return std::abs(diagonal(to) - diagonal(from)) <= 32 + max_drift(distance);
+    };
+    constexpr std::size_t MEDIAN_RADIUS = 8;  // neighbours on each side
+    constexpr std::int64_t MEDIAN_TOL = 20;   // bp off the local median diagonal
+
+    std::vector<std::size_t> pair;  // fragments of this pair and strand
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        if (fragments[f].rhs_id == kept.rhs_id &&
+            fragments[f].strand == kept.strand &&
+            !fragment_anchors[f].empty()) {
+            pair.push_back(f);
+        }
+    }
+    std::sort(pair.begin(), pair.end(), [&](std::size_t a, std::size_t b) {
+        return fragment_anchors[a].front().first < fragment_anchors[b].front().first;
+    });
+
+    std::size_t seed = pair.size();
+    std::uint32_t seed_len = 0;
+    for (std::size_t p = 0; p < pair.size(); ++p) {
+        const auto& o = fragments[pair[p]];
+        if (o.lhs_begin < kept.lhs_begin || o.lhs_end > kept.lhs_end ||
+            o.rhs_begin < kept.rhs_begin || o.rhs_end > kept.rhs_end) {
+            continue;
+        }
+        if (seed == pair.size() || o.lhs_end - o.lhs_begin > seed_len) {
+            seed = p;
+            seed_len = o.lhs_end - o.lhs_begin;
+        }
+    }
+    if (seed == pair.size()) {
+        return {};
+    }
+
+    std::vector<std::size_t> chain{pair[seed]};
+    for (std::size_t p = seed + 1, last = pair[seed]; p < pair.size(); ++p) {
+        const auto& a = fragment_anchors[pair[p]];
+        const auto& b = fragment_anchors[last];
+        if (a.front().first <= b.back().first || !continues(b.back(), a.front())) {
+            continue;
+        }
+        chain.push_back(pair[p]);
+        last = pair[p];
+    }
+    for (std::size_t p = seed, first = pair[seed]; p-- > 0;) {
+        const auto& a = fragment_anchors[pair[p]];
+        const auto& b = fragment_anchors[first];
+        if (a.back().first >= b.front().first || !continues(a.back(), b.front())) {
+            continue;
+        }
+        chain.push_back(pair[p]);
+        first = pair[p];
+    }
+    std::sort(chain.begin(), chain.end(), [&](std::size_t a, std::size_t b) {
+        return fragment_anchors[a].front().first < fragment_anchors[b].front().first;
+    });
+
+    std::vector<Anchor> dense;
+    for (std::size_t f : chain) {
+        dense.insert(dense.end(), fragment_anchors[f].begin(), fragment_anchors[f].end());
+    }
+
+    std::vector<std::int64_t> window;
+    window.reserve(2 * MEDIAN_RADIUS + 1);
+    std::vector<Anchor> dst;
+    for (std::size_t n = 0; n < dense.size(); ++n) {
+        const Anchor& a = dense[n];
+        if (!dst.empty() && a.first < dst.back().first + spacing) {
+            continue;
+        }
+        window.clear();
+        for (std::size_t m = n > MEDIAN_RADIUS ? n - MEDIAN_RADIUS : 0;
+             m < std::min(dense.size(), n + MEDIAN_RADIUS + 1); ++m) {
+            window.push_back(diagonal(dense[m]));
+        }
+        std::nth_element(window.begin(), window.begin() + window.size() / 2, window.end());
+        if (std::abs(diagonal(a) - window[window.size() / 2]) > MEDIAN_TOL) {
+            continue;
+        }
+        if (!dst.empty()) {
+            const Anchor& b = dst.back();
+            const std::int64_t dl = static_cast<std::int64_t>(a.first) - b.first;
+            const std::int64_t dr = fwd
+                ? static_cast<std::int64_t>(a.second) - b.second
+                : static_cast<std::int64_t>(b.second) - a.second;
+            // not collinear, or more indel imbalance than drift explains
+            if (dr <= 0 || std::abs(dl - dr) > max_drift(dl)) {
+                continue;
+            }
+        }
+        dst.push_back(a);
+    }
+    return dst;
+}
+
 Graph_Constructor::Graph_Constructor(Graph &graph, std::shared_ptr<thread_pool::ThreadPool> thread_pool)
   : graph_(graph), thread_pool_(thread_pool ?
                                 thread_pool :
@@ -353,6 +481,17 @@ void Graph_Constructor::Construct(
             << std::endl;
 }
 
+// Called once all output files are closed. Ends the process while the overlap
+// piles are still in scope, so neither they nor the reads, k-mer counter and
+// minimizer index are destroyed: that teardown is single-threaded and took
+// ~190 s of a 21 min chr18 run.
+[[noreturn]] static void ExitWithoutTeardown() {
+  std::cout.flush();
+  std::cerr.flush();
+  std::fflush(nullptr);
+  std::_Exit(0);
+}
+
 void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, Program_Parameters &param){
     std::vector<std::vector<extended_overlap>> extended_overlaps(sequences.size());
     biosoup::Timer timer{};
@@ -367,7 +506,7 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
 
       if (param.dump_all_overlaps) {
         // Raw overlaps were already dumped inside ConstructOverlapsForCorrection.
-        return;
+        ExitWithoutTeardown();
       }
 
       if (param.dump_overlaps_only) {
@@ -378,11 +517,12 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
                   << std::endl;
         graph_.PrintBackboneOverlapsWithFeatures(
             extended_overlaps, sequences, "correction_overlaps_features.paf");
-        return;
+        ExitWithoutTeardown();
       }
 
       SelectCorrectionOverlaps(sequences, extended_overlaps, param);
-      AlignCorrectionOverlaps(sequences, extended_overlaps);
+      AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
+                          param.max_edit_rate);
     } else {
       LoadOverlapsAndAlign(param, sequences, extended_overlaps);
     }
@@ -392,7 +532,9 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
               << std::fixed << timer.Stop() << "s"
               << std::endl;
     std::cerr << "Printing correction overlaps!" << std::endl;
-    graph_.PrintCorrectionOverlaps(extended_overlaps, sequences, "correction.paf");
+    graph_.PrintCorrectionOverlaps(extended_overlaps, sequences, "correction.paf",
+                                   thread_pool_);
+    ExitWithoutTeardown();
 }
 
 // In-process replacement for mm2_draven_match.ipynb: score every backbone
@@ -506,6 +648,7 @@ void Graph_Constructor::SelectCorrectionOverlaps(
       edlib_align tmp = {};
       extended_overlap total_ovlp{overlap, tmp, 0, 0};
       total_ovlp.correction_overlap = false;
+      total_ovlp.anchors = std::move(pile[k].anchors);
       total_ovlp.lhs_begin_original = o.lhs_begin;
       total_ovlp.lhs_end_original = o.lhs_end;
       total_ovlp.rhs_begin_original = o.rhs_begin;
@@ -834,12 +977,15 @@ void Graph_Constructor::LoadOverlapsAndAlign(
       << skipped_load
       << std::endl;
 
-  AlignCorrectionOverlaps(sequences, extended_overlaps);
+  AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
+                          param.max_edit_rate);
 }
 
 void Graph_Constructor::AlignCorrectionOverlaps(
     std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
-    std::vector<std::vector<extended_overlap>> &extended_overlaps) {
+    std::vector<std::vector<extended_overlap>> &extended_overlaps,
+    std::uint32_t kmer_len,
+    double max_edit_rate) {
 
   // ========================================================================
   // TRIM TERMINAL EDLIB GAPS
@@ -1219,6 +1365,14 @@ void Graph_Constructor::AlignCorrectionOverlaps(
   // ALIGN EACH PILE
   // ========================================================================
 
+  biosoup::Timer timer{};
+  timer.Start();
+
+  std::atomic<std::uint64_t> anchored_overlaps{0};
+  std::atomic<std::uint64_t> anchors_used{0};
+  std::atomic<std::uint64_t> anchors_rejected{0};
+  std::atomic<std::uint64_t> over_edit_cap{0};
+
   auto resolve_alignments =
       [&](std::uint32_t i) -> void {
 
@@ -1283,12 +1437,70 @@ void Graph_Constructor::AlignCorrectionOverlaps(
 
       // ====================================================================
       // GLOBAL EDLIB ALIGNMENT
+      //
+      // With chain anchors: NW between consecutive anchors, mapped into the
+      // extracted (on '-' reverse-complemented) lhs / rhs coordinates.
       // ====================================================================
 
-      overlap.edlib_alignment =
-          edlib_wrapper(
-              lhs,
-              rhs);
+      // Give up on overlaps of unrelated sequence (~0.5 edits per base, real
+      // overlaps ~0.08) instead of aligning them in full.
+      const std::int64_t max_edit_distance =
+          max_edit_rate > 0 ?
+              static_cast<std::int64_t>(
+                  max_edit_rate * std::max(lhs.size(), rhs.size())) :
+              -1;
+
+      if (overlap.anchors.empty()) {
+
+        overlap.edlib_alignment =
+            edlib_wrapper(
+                lhs,
+                rhs,
+                max_edit_distance);
+
+      } else {
+
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> local;
+        local.reserve(overlap.anchors.size());
+
+        for (const auto &a : overlap.anchors) {
+          if (a.first < overlap.overlap.lhs_begin ||
+              a.first + kmer_len > overlap.overlap.lhs_end ||
+              a.second < overlap.overlap.rhs_begin ||
+              a.second + kmer_len > overlap.overlap.rhs_end) {
+            continue;
+          }
+          local.emplace_back(
+              a.first - overlap.overlap.lhs_begin,
+              overlap.overlap.strand ?
+                  a.second - overlap.overlap.rhs_begin :
+                  overlap.overlap.rhs_end - (a.second + kmer_len));
+        }
+
+        std::uint32_t used = 0;
+        std::uint32_t rejected = 0;
+        overlap.edlib_alignment =
+            anchored_edlib_wrapper(
+                lhs,
+                rhs,
+                local,
+                kmer_len,
+                max_edit_distance,
+                &used,
+                &rejected);
+
+        anchored_overlaps += 1;
+        anchors_used += used;
+        anchors_rejected += rejected + (overlap.anchors.size() - local.size());
+
+        std::vector<std::pair<std::uint32_t, std::uint32_t>>().swap(
+            overlap.anchors);
+      }
+
+      if (max_edit_distance >= 0 &&
+          overlap.edlib_alignment.cigar.empty()) {
+        over_edit_cap += 1;
+      }
 
 
       // ====================================================================
@@ -1333,9 +1545,23 @@ void Graph_Constructor::AlignCorrectionOverlaps(
       sequences.size());
 
 
-  for (std::uint32_t i = 0;
-       i < sequences.size();
-       ++i) {
+  // Largest piles first, so a few expensive ones (repeats aligned without
+  // anchors) do not run alone at the end.
+  std::vector<std::uint64_t> pile_bases(sequences.size(), 0);
+  for (std::uint32_t i = 0; i < sequences.size(); ++i) {
+    for (const auto &overlap : extended_overlaps[i]) {
+      pile_bases[i] += overlap.overlap.lhs_end - overlap.overlap.lhs_begin;
+    }
+  }
+  std::vector<std::uint32_t> pile_order(sequences.size());
+  std::iota(pile_order.begin(), pile_order.end(), 0);
+  std::sort(pile_order.begin(), pile_order.end(),
+            [&](std::uint32_t a, std::uint32_t b) {
+              return pile_bases[a] > pile_bases[b];
+            });
+
+
+  for (std::uint32_t i : pile_order) {
 
     alignment_futures.emplace_back(
         thread_pool_->Submit(
@@ -1385,6 +1611,11 @@ void Graph_Constructor::AlignCorrectionOverlaps(
       << aligned
       << " overlaps, rejected "
       << rejected
+      << " (" << over_edit_cap << " above --max-edit-rate " << max_edit_rate << ")"
+      << "; " << anchored_overlaps << " aligned between "
+      << anchors_used << " anchors ("
+      << anchors_rejected << " anchors unusable) "
+      << std::fixed << timer.Stop() << "s"
       << std::endl;
 }
 
@@ -1834,15 +2065,29 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       return std::make_pair(from, to);
   };
 
+  // Chain anchors are only used to align the RF-selected correction overlaps.
+  const bool keep_anchors = param.correction_overlaps &&
+                            !param.rf_model_path.empty() &&
+                            param.anchor_spacing > 0 &&
+                            !param.dump_all_overlaps &&
+                            !param.dump_overlaps_only;
+
   auto map_sequences = [&](std::uint32_t i) -> std::vector<extended_overlap> { // map sequences
   //auto map_sequences = [&](std::uint32_t i) -> std::vector<std::vector<float>> { // map sequences
     std::vector<biosoup::Overlap> ovlps;
+    std::vector<ram::MinimizerEngine::Anchors> ovlp_anchors;
+    auto *anchors_out = keep_anchors ? &ovlp_anchors : nullptr;
     if(graph_.piles_[i]->is_hor()){
      ovlps = minimizer_engine.MapRepetitive(sequences[i], true, true,
-                                                               false);
+                                                               false, nullptr, anchors_out);
     } else {
       ovlps = minimizer_engine.Map(sequences[i], true, true,
-                                                                false);
+                                                                false, nullptr, anchors_out);
+    }
+    // ovlps is reordered below; keep the fragments ovlp_anchors is indexed by
+    std::vector<biosoup::Overlap> fragments;
+    if (keep_anchors) {
+      fragments = ovlps;
     }
 
     if (param.dump_all_overlaps) {
@@ -1889,6 +2134,13 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
       for (auto &ovlp : no_dups_overlaps) {
 
+        // before extrapolation: anchors are looked up by the found span
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> anchors;
+        if (keep_anchors) {
+          anchors = collect_anchors(ovlp, fragments, ovlp_anchors,
+                                    param.anchor_spacing);
+        }
+
         std::uint32_t left_overhang = 0;
         std::uint32_t right_overhang = 0;
         const std::uint32_t lhs_len = sequences[i]->inflated_len;
@@ -1926,6 +2178,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
           
 
         extended_overlap total_ovlp{ ovlp, {}, 0, 0 };
+        total_ovlp.anchors = std::move(anchors);
         total_ovlp.lhs_begin_original = lhs_begin_original;
         total_ovlp.lhs_end_original = lhs_end_original;
         total_ovlp.rhs_begin_original = rhs_begin_original;
@@ -2055,6 +2308,21 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     }
   } else if(!param.minimizers){
     minimizer_engine.LoadFastK();
+  }
+
+  if (keep_anchors) {
+    // A unique minimizer occurs about once per covering read; repeat copies
+    // multiply that, and their matches may pin the alignment to another copy.
+    const ram::KmerCounter *counter =
+        internal_counter_ ? internal_counter_.get() : internal_counter.get();
+    biosoup::Timer peak_timer{};
+    peak_timer.Start();
+    const std::uint32_t peak = counter ? counter->EstimatePeak() : 0;
+    const std::uint32_t max_occurrence = 2 * (peak ? peak : param.coverage);
+    minimizer_engine.set_anchor_max_occurrence(max_occurrence);
+    std::cerr << "[raven::] alignment anchors: minimizers with > "
+              << max_occurrence << " occurrences left out (coverage peak "
+              << peak << ") " << std::fixed << peak_timer.Stop() << "s" << std::endl;
   }
 
   if (use_fused_fastk) {

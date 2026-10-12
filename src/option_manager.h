@@ -53,6 +53,12 @@ struct Program_Parameters {
   bool rf_require_full_window = true;
   // write every candidate's probability and selection to rf_selection.tsv
   bool dump_rf_scores = false;
+  // keep ram's chain anchors ~this many bp apart and align correction
+  // overlaps piecewise between them (0: one global alignment per overlap)
+  std::uint32_t anchor_spacing = 500;
+  // give up aligning a correction overlap once its edit distance exceeds this
+  // fraction of its length (0: no limit)
+  double max_edit_rate = 0.3;
   // path to the precomputed FastK counts (used when --internal-count is off)
   std::string fastk_path = "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19";
 

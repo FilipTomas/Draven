@@ -102,6 +102,11 @@ struct extended_overlap {
   bool correction_overlap;
 
   int classification_label;
+
+  // (lhs, rhs) k-mer starts of the chained minimizer matches backing this
+  // overlap, thinned to ~--anchor-spacing apart, increasing lhs; used to
+  // align between anchors instead of one global alignment
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> anchors;
 };
 
 
