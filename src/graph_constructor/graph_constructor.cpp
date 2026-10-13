@@ -542,24 +542,51 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
             extended_overlaps, sequences, "correction_overlaps_features.paf");
         ExitWithoutTeardown();
       }
+    }
 
+    // correction.paf is written pile by pile as piles finish aligning, and
+    // each pile is freed with its CIGARs right away, instead of holding every
+    // CIGAR until the end. Piles land in completion order, but each pile's
+    // lines (all alignments of one target read) stay together and in order,
+    // which is all HERRO reads per target.
+    std::ofstream paf("correction.paf");
+    if (!paf) {
+      std::cerr << "[raven::] error: cannot open correction.paf" << std::endl;
+      ExitWithoutTeardown();
+    }
+    std::mutex paf_mutex;
+    std::uint64_t written = 0;
+    std::uint64_t skipped = 0;
+    auto write_pile = [&](std::uint32_t i) -> void {
+      CorrectionPafText text =
+          graph_.FormatCorrectionOverlaps(extended_overlaps[i], sequences);
+      std::vector<extended_overlap>().swap(extended_overlaps[i]);
+      std::lock_guard<std::mutex> lock(paf_mutex);
+      paf << text.paf;
+      std::cerr << text.log;
+      written += text.written;
+      skipped += text.skipped;
+    };
+
+    if (compute_overlaps) {
       LogOverlapMemory(extended_overlaps, "before selection");
       SelectCorrectionOverlaps(sequences, extended_overlaps, param);
       LogOverlapMemory(extended_overlaps, "after selection");
       AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
-                          param.max_edit_rate);
+                          param.max_edit_rate, write_pile);
       LogOverlapMemory(extended_overlaps, "after alignment");
     } else {
-      LoadOverlapsAndAlign(param, sequences, extended_overlaps);
+      LoadOverlapsAndAlign(param, sequences, extended_overlaps, write_pile);
     }
+    paf.close();
     //AlignBackboneReads(sequences, extended_overlaps, timer, param);
     //ConstructOnlyBackboneGraph(sequences, extended_overlaps, timer, param);
+    std::cerr << "[raven::Graph::PrintCorrectionOverlaps] printed "
+              << written << " overlaps, skipped " << skipped
+              << " (written while aligning)" << std::endl;
     std::cerr << "[raven::Graph::Construct] reached checkpoint "
               << std::fixed << timer.Stop() << "s"
               << std::endl;
-    std::cerr << "Printing correction overlaps!" << std::endl;
-    graph_.PrintCorrectionOverlaps(extended_overlaps, sequences, "correction.paf",
-                                   thread_pool_);
     ExitWithoutTeardown();
 }
 
@@ -770,7 +797,8 @@ void Graph_Constructor::SelectCorrectionOverlaps(
 void Graph_Constructor::LoadOverlapsAndAlign(
     Program_Parameters &param,
     std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
-    std::vector<std::vector<extended_overlap>> &extended_overlaps) {
+    std::vector<std::vector<extended_overlap>> &extended_overlaps,
+    const std::function<void(std::uint32_t)> &pile_aligned) {
 
   // const std::string overlaps_path =
   //     param.input_paf_path;
@@ -1004,14 +1032,15 @@ void Graph_Constructor::LoadOverlapsAndAlign(
       << std::endl;
 
   AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
-                          param.max_edit_rate);
+                          param.max_edit_rate, pile_aligned);
 }
 
 void Graph_Constructor::AlignCorrectionOverlaps(
     std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
     std::vector<std::vector<extended_overlap>> &extended_overlaps,
     std::uint32_t kmer_len,
-    double max_edit_rate) {
+    double max_edit_rate,
+    const std::function<void(std::uint32_t)> &pile_aligned) {
 
   // ========================================================================
   // TRIM TERMINAL EDLIB GAPS
@@ -1398,6 +1427,8 @@ void Graph_Constructor::AlignCorrectionOverlaps(
   std::atomic<std::uint64_t> anchors_used{0};
   std::atomic<std::uint64_t> anchors_rejected{0};
   std::atomic<std::uint64_t> over_edit_cap{0};
+  std::atomic<std::uint64_t> aligned{0};
+  std::atomic<std::uint64_t> rejected{0};
 
   auto resolve_alignments =
       [&](std::uint32_t i) -> void {
@@ -1556,6 +1587,17 @@ void Graph_Constructor::AlignCorrectionOverlaps(
       overlap.correction_overlap =
           true;
     }
+
+    std::uint64_t pile_aligned_count = 0;
+    for (const auto &overlap : extended_overlaps[i]) {
+      pile_aligned_count += overlap.correction_overlap;
+    }
+    aligned += pile_aligned_count;
+    rejected += extended_overlaps[i].size() - pile_aligned_count;
+
+    if (pile_aligned) {
+      pile_aligned(i);  // e.g. write the pile out and free it
+    }
   };
 
 
@@ -1609,28 +1651,6 @@ void Graph_Constructor::AlignCorrectionOverlaps(
   // ========================================================================
   // DIAGNOSTICS
   // ========================================================================
-
-  std::uint64_t aligned = 0;
-  std::uint64_t rejected = 0;
-
-
-  for (const auto &pile :
-       extended_overlaps) {
-
-    for (const auto &overlap :
-         pile) {
-
-      if (overlap.correction_overlap) {
-
-        ++aligned;
-
-      } else {
-
-        ++rejected;
-      }
-    }
-  }
-
 
   std::cerr
       << "[raven::LoadAndAlign] successfully aligned/trimmed "

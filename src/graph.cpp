@@ -761,16 +761,9 @@ namespace raven {
     os.close();
   }
 
-void Graph::PrintCorrectionOverlaps(
-    const std::vector<std::vector<extended_overlap>>& overlaps,
-    const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
-    const std::string& path,
-    std::shared_ptr<thread_pool::ThreadPool> thread_pool) const {
-
-  if (path.empty()) {
-    return;
-  }
-
+CorrectionPafText Graph::FormatCorrectionOverlaps(
+    const std::vector<extended_overlap>& pile,
+    const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences) const {
 
   // ========================================================================
   // INTERNAL EDLIB ORIENTATION
@@ -851,6 +844,322 @@ void Graph::PrintCorrectionOverlaps(
   };
 
 
+  CorrectionPafText result;
+  std::ostringstream os;
+  std::ostringstream log;
+  std::uint64_t& written = result.written;
+  std::uint64_t& skipped = result.skipped;
+
+  for (const auto& jt : pile) {
+
+
+    // ====================================================================
+    // Only output overlaps whose alignment + terminal trimming succeeded.
+    // ====================================================================
+
+    if (!jt.correction_overlap) {
+
+      ++skipped;
+      continue;
+    }
+
+
+    // ====================================================================
+    // PAF coordinates
+    //
+    // query  = rhs/support
+    // target = lhs/backbone
+    // ====================================================================
+
+    const std::uint32_t qs =
+        jt.overlap.rhs_begin;
+
+    const std::uint32_t qe =
+        jt.overlap.rhs_end;
+
+    const std::uint32_t ts =
+        jt.overlap.lhs_begin;
+
+    const std::uint32_t te =
+        jt.overlap.lhs_end;
+
+
+    const std::uint32_t qlen =
+        sequences[
+            jt.overlap.rhs_id
+        ]->inflated_len;
+
+    const std::uint32_t tlen =
+        sequences[
+            jt.overlap.lhs_id
+        ]->inflated_len;
+
+
+    // ====================================================================
+    // Coordinate validation
+    // ====================================================================
+
+    if (qe <= qs ||
+        te <= ts ||
+        qe > qlen ||
+        te > tlen) {
+
+      log
+          << "Invalid correction overlap coordinates:"
+          << " qs=" << qs
+          << " qe=" << qe
+          << " qlen=" << qlen
+          << " ts=" << ts
+          << " te=" << te
+          << " tlen=" << tlen
+          << std::endl;
+
+      ++skipped;
+      continue;
+    }
+
+
+    // ====================================================================
+    // Transpose CIGAR into output PAF orientation
+    // ====================================================================
+
+    const std::string fixed_cigar =
+        transpose_cigar(
+            jt.edlib_alignment.cigar);
+
+
+    if (fixed_cigar.empty()) {
+
+      ++skipped;
+      continue;
+    }
+
+
+    // ====================================================================
+    // HERRO safety:
+    //
+    // terminal I/D should already have been removed.
+    //
+    // We require the final PAF CIGAR to begin and end with an aligned
+    // operation.
+    // ====================================================================
+
+    const char first_op =
+        first_cigar_op(
+            fixed_cigar);
+
+    const char last_op =
+        last_cigar_op(
+            fixed_cigar);
+
+
+    if ((first_op != 'M' &&
+         first_op != '=' &&
+         first_op != 'X') ||
+        (last_op != 'M' &&
+         last_op != '=' &&
+         last_op != 'X')) {
+
+      log
+          << "Terminal gap survived trimming:"
+          << "\n  query  = "
+          << sequences[jt.overlap.rhs_id]->name
+          << "\n  target = "
+          << sequences[jt.overlap.lhs_id]->name
+          << "\n  strand = "
+          << (jt.overlap.strand ? '+' : '-')
+          << "\n  cigar  = "
+          << fixed_cigar.substr(
+                 0,
+                 std::min<std::size_t>(
+                     fixed_cigar.size(),
+                     200))
+          << std::endl;
+
+      ++skipped;
+      continue;
+    }
+
+
+    // ====================================================================
+    // Verify that CIGAR consumption exactly matches PAF coordinates.
+    //
+    // PAF semantics:
+    //
+    //   M / = / X : consume query + target
+    //   I         : consume query
+    //   D         : consume target
+    // ====================================================================
+
+    std::uint64_t cigar_query_consumed = 0;
+    std::uint64_t cigar_target_consumed = 0;
+
+    std::uint64_t num = 0;
+
+
+    for (char c : fixed_cigar) {
+
+      if (std::isdigit(
+              static_cast<unsigned char>(c))) {
+
+        num =
+            num * 10 +
+            static_cast<std::uint64_t>(
+                c - '0');
+
+        continue;
+      }
+
+
+      if (c == 'M' ||
+          c == '=' ||
+          c == 'X') {
+
+        cigar_query_consumed += num;
+        cigar_target_consumed += num;
+
+      } else if (c == 'I') {
+
+        cigar_query_consumed += num;
+
+      } else if (c == 'D') {
+
+        cigar_target_consumed += num;
+
+      } else {
+
+        log
+            << "Unexpected CIGAR operation: "
+            << c
+            << std::endl;
+
+        num = 0;
+        continue;
+      }
+
+
+      num = 0;
+    }
+
+
+    const std::uint64_t query_span =
+        static_cast<std::uint64_t>(
+            qe - qs);
+
+    const std::uint64_t target_span =
+        static_cast<std::uint64_t>(
+            te - ts);
+
+
+    if (cigar_query_consumed != query_span ||
+        cigar_target_consumed != target_span) {
+
+      log
+          << "CIGAR/PAF span mismatch:"
+          << "\n  query span      = "
+          << query_span
+          << "\n  cigar query     = "
+          << cigar_query_consumed
+          << "\n  target span     = "
+          << target_span
+          << "\n  cigar target    = "
+          << cigar_target_consumed
+          << "\n  strand          = "
+          << (jt.overlap.strand ? '+' : '-')
+          << "\n  query           = "
+          << sequences[jt.overlap.rhs_id]->name
+          << "\n  target          = "
+          << sequences[jt.overlap.lhs_id]->name
+          << "\n  cigar           = "
+          << fixed_cigar.substr(
+                 0,
+                 std::min<std::size_t>(
+                     fixed_cigar.size(),
+                     200))
+          << std::endl;
+
+      ++skipped;
+      continue;
+    }
+
+
+    // ====================================================================
+    // OUTPUT PAF
+    // ====================================================================
+
+    os
+        // Query = supporting read
+        << sequences[
+               jt.overlap.rhs_id
+           ]->name
+        << '\t'
+
+        << qlen
+        << '\t'
+
+        << qs
+        << '\t'
+
+        << qe
+        << '\t'
+
+        // Strand relative to backbone
+        << (jt.overlap.strand
+                ? '+'
+                : '-')
+        << '\t'
+
+        // Target = backbone
+        << sequences[
+               jt.overlap.lhs_id
+           ]->name
+        << '\t'
+
+        << tlen
+        << '\t'
+
+        << ts
+        << '\t'
+
+        << te
+        << '\t'
+
+        // Alignment statistics
+        << jt.edlib_alignment.matches
+        << '\t'
+
+        << jt.edlib_alignment.block_length
+        << '\t'
+
+        << 255
+        << '\t'
+
+        // HERRO expects cg:Z as final field
+        << "cg:Z:"
+        << fixed_cigar
+        << '\n';
+
+
+    ++written;
+  }
+
+  result.paf = os.str();
+  result.log = log.str();
+  return result;
+
+}
+
+void Graph::PrintCorrectionOverlaps(
+    const std::vector<std::vector<extended_overlap>>& overlaps,
+    const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
+    const std::string& path,
+    std::shared_ptr<thread_pool::ThreadPool> thread_pool) const {
+
+  if (path.empty()) {
+    return;
+  }
+
+
   biosoup::Timer timer{};
   timer.Start();
 
@@ -867,326 +1176,15 @@ void Graph::PrintCorrectionOverlaps(
   }
 
 
-  // One pile's PAF lines and warnings, formatted off the main thread.
-  struct PileText {
-    std::string paf;
-    std::string log;
-    std::uint64_t written = 0;
-    std::uint64_t skipped = 0;
-  };
-
-
-  auto format_pile = [&](std::size_t pile_id) -> PileText {
-
-    PileText result;
-    std::ostringstream os;
-    std::ostringstream log;
-    std::uint64_t& written = result.written;
-    std::uint64_t& skipped = result.skipped;
-
-    for (const auto& jt : overlaps[pile_id]) {
-
-
-      // ====================================================================
-      // Only output overlaps whose alignment + terminal trimming succeeded.
-      // ====================================================================
-
-      if (!jt.correction_overlap) {
-
-        ++skipped;
-        continue;
-      }
-
-
-      // ====================================================================
-      // PAF coordinates
-      //
-      // query  = rhs/support
-      // target = lhs/backbone
-      // ====================================================================
-
-      const std::uint32_t qs =
-          jt.overlap.rhs_begin;
-
-      const std::uint32_t qe =
-          jt.overlap.rhs_end;
-
-      const std::uint32_t ts =
-          jt.overlap.lhs_begin;
-
-      const std::uint32_t te =
-          jt.overlap.lhs_end;
-
-
-      const std::uint32_t qlen =
-          sequences[
-              jt.overlap.rhs_id
-          ]->inflated_len;
-
-      const std::uint32_t tlen =
-          sequences[
-              jt.overlap.lhs_id
-          ]->inflated_len;
-
-
-      // ====================================================================
-      // Coordinate validation
-      // ====================================================================
-
-      if (qe <= qs ||
-          te <= ts ||
-          qe > qlen ||
-          te > tlen) {
-
-        log
-            << "Invalid correction overlap coordinates:"
-            << " qs=" << qs
-            << " qe=" << qe
-            << " qlen=" << qlen
-            << " ts=" << ts
-            << " te=" << te
-            << " tlen=" << tlen
-            << std::endl;
-
-        ++skipped;
-        continue;
-      }
-
-
-      // ====================================================================
-      // Transpose CIGAR into output PAF orientation
-      // ====================================================================
-
-      const std::string fixed_cigar =
-          transpose_cigar(
-              jt.edlib_alignment.cigar);
-
-
-      if (fixed_cigar.empty()) {
-
-        ++skipped;
-        continue;
-      }
-
-
-      // ====================================================================
-      // HERRO safety:
-      //
-      // terminal I/D should already have been removed.
-      //
-      // We require the final PAF CIGAR to begin and end with an aligned
-      // operation.
-      // ====================================================================
-
-      const char first_op =
-          first_cigar_op(
-              fixed_cigar);
-
-      const char last_op =
-          last_cigar_op(
-              fixed_cigar);
-
-
-      if ((first_op != 'M' &&
-           first_op != '=' &&
-           first_op != 'X') ||
-          (last_op != 'M' &&
-           last_op != '=' &&
-           last_op != 'X')) {
-
-        log
-            << "Terminal gap survived trimming:"
-            << "\n  query  = "
-            << sequences[jt.overlap.rhs_id]->name
-            << "\n  target = "
-            << sequences[jt.overlap.lhs_id]->name
-            << "\n  strand = "
-            << (jt.overlap.strand ? '+' : '-')
-            << "\n  cigar  = "
-            << fixed_cigar.substr(
-                   0,
-                   std::min<std::size_t>(
-                       fixed_cigar.size(),
-                       200))
-            << std::endl;
-
-        ++skipped;
-        continue;
-      }
-
-
-      // ====================================================================
-      // Verify that CIGAR consumption exactly matches PAF coordinates.
-      //
-      // PAF semantics:
-      //
-      //   M / = / X : consume query + target
-      //   I         : consume query
-      //   D         : consume target
-      // ====================================================================
-
-      std::uint64_t cigar_query_consumed = 0;
-      std::uint64_t cigar_target_consumed = 0;
-
-      std::uint64_t num = 0;
-
-
-      for (char c : fixed_cigar) {
-
-        if (std::isdigit(
-                static_cast<unsigned char>(c))) {
-
-          num =
-              num * 10 +
-              static_cast<std::uint64_t>(
-                  c - '0');
-
-          continue;
-        }
-
-
-        if (c == 'M' ||
-            c == '=' ||
-            c == 'X') {
-
-          cigar_query_consumed += num;
-          cigar_target_consumed += num;
-
-        } else if (c == 'I') {
-
-          cigar_query_consumed += num;
-
-        } else if (c == 'D') {
-
-          cigar_target_consumed += num;
-
-        } else {
-
-          log
-              << "Unexpected CIGAR operation: "
-              << c
-              << std::endl;
-
-          num = 0;
-          continue;
-        }
-
-
-        num = 0;
-      }
-
-
-      const std::uint64_t query_span =
-          static_cast<std::uint64_t>(
-              qe - qs);
-
-      const std::uint64_t target_span =
-          static_cast<std::uint64_t>(
-              te - ts);
-
-
-      if (cigar_query_consumed != query_span ||
-          cigar_target_consumed != target_span) {
-
-        log
-            << "CIGAR/PAF span mismatch:"
-            << "\n  query span      = "
-            << query_span
-            << "\n  cigar query     = "
-            << cigar_query_consumed
-            << "\n  target span     = "
-            << target_span
-            << "\n  cigar target    = "
-            << cigar_target_consumed
-            << "\n  strand          = "
-            << (jt.overlap.strand ? '+' : '-')
-            << "\n  query           = "
-            << sequences[jt.overlap.rhs_id]->name
-            << "\n  target          = "
-            << sequences[jt.overlap.lhs_id]->name
-            << "\n  cigar           = "
-            << fixed_cigar.substr(
-                   0,
-                   std::min<std::size_t>(
-                       fixed_cigar.size(),
-                       200))
-            << std::endl;
-
-        ++skipped;
-        continue;
-      }
-
-
-      // ====================================================================
-      // OUTPUT PAF
-      // ====================================================================
-
-      os
-          // Query = supporting read
-          << sequences[
-                 jt.overlap.rhs_id
-             ]->name
-          << '\t'
-
-          << qlen
-          << '\t'
-
-          << qs
-          << '\t'
-
-          << qe
-          << '\t'
-
-          // Strand relative to backbone
-          << (jt.overlap.strand
-                  ? '+'
-                  : '-')
-          << '\t'
-
-          // Target = backbone
-          << sequences[
-                 jt.overlap.lhs_id
-             ]->name
-          << '\t'
-
-          << tlen
-          << '\t'
-
-          << ts
-          << '\t'
-
-          << te
-          << '\t'
-
-          // Alignment statistics
-          << jt.edlib_alignment.matches
-          << '\t'
-
-          << jt.edlib_alignment.block_length
-          << '\t'
-
-          << 255
-          << '\t'
-
-          // HERRO expects cg:Z as final field
-          << "cg:Z:"
-          << fixed_cigar
-          << '\n';
-
-
-      ++written;
-    }
-
-    result.paf = os.str();
-    result.log = log.str();
-    return result;
+  auto format_pile = [&](std::size_t pile_id) -> CorrectionPafText {
+    return FormatCorrectionOverlaps(overlaps[pile_id], sequences);
   };
 
 
   std::uint64_t written = 0;
   std::uint64_t skipped = 0;
 
-  auto emit = [&](PileText&& text) {
+  auto emit = [&](CorrectionPafText&& text) {
     out << text.paf;
     std::cerr << text.log;
     written += text.written;
@@ -1201,7 +1199,7 @@ void Graph::PrintCorrectionOverlaps(
     // Formatted in parallel but written in pile order, so the file is the
     // same as a serial write; a bounded window of piles is held at once.
     const std::size_t window = 4 * thread_pool->num_threads();
-    std::deque<std::future<PileText>> pending;
+    std::deque<std::future<CorrectionPafText>> pending;
     std::size_t next = 0;
     while (next < overlaps.size() || !pending.empty()) {
       while (next < overlaps.size() && pending.size() < window) {

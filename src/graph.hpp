@@ -30,6 +30,14 @@
 #include "state_manager.h"
 
 namespace raven {
+
+  // PAF text of one pile's correction overlaps, with warnings and counts
+  struct CorrectionPafText {
+    std::string paf;
+    std::string log;
+    std::uint64_t written = 0;
+    std::uint64_t skipped = 0;
+  };
   constexpr std::uint8_t use_frequencies = 0;
   constexpr std::uint8_t variant_call_th = 3;
   constexpr double freq_low_th = 0.333;
@@ -84,6 +92,13 @@ namespace raven {
     void PrintOverlaps(std::vector<std::vector<extended_overlap>> overlaps,
                        std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, bool print_cigar,
                        const std::string &path) const;
+
+    // PAF lines of one pile's aligned correction overlaps (query = the
+    // supporting read, target = the pile's read), warnings for the ones
+    // skipped, and their counts.
+    CorrectionPafText FormatCorrectionOverlaps(
+      const std::vector<extended_overlap>& pile,
+      const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences) const;
 
     // Pile formatting runs on thread_pool when one is given.
     void PrintCorrectionOverlaps(

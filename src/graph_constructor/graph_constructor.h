@@ -2,6 +2,7 @@
 #ifndef RAVEN_GRAPH_CONSTRUCTOR_H
 #define RAVEN_GRAPH_CONSTRUCTOR_H
 
+#include <functional>
 #include <memory>
 #include <string>
 #include "biosoup/nucleic_acid.hpp"
@@ -93,11 +94,15 @@ private:
                            bool load_cigar,
                            Program_Parameters &param);
 
-  void LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps);
+  // pile_aligned(i), if set, runs on the worker thread as soon as pile i
+  // is aligned (e.g. to write it out and free it).
+  void LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps,
+                            const std::function<void(std::uint32_t)> &pile_aligned = nullptr);
   void AlignCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                std::vector<std::vector<extended_overlap>> &extended_overlaps,
                                std::uint32_t kmer_len,
-                               double max_edit_rate);
+                               double max_edit_rate,
+                               const std::function<void(std::uint32_t)> &pile_aligned = nullptr);
   void SelectCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                 std::vector<std::vector<extended_overlap>> &extended_overlaps,
                                 Program_Parameters &param);
