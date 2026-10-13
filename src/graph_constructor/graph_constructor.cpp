@@ -2389,6 +2389,14 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
   graph_.PrintPiles();
 
+  // Correcting, qualities are read only by sketching (CNN features); free
+  // them (1 B per base). Assembly keeps them.
+  if (param.correction_overlaps) {
+    for (auto &it : sequences) {
+      std::vector<std::uint8_t>().swap(it->quality);
+    }
+  }
+
   // ---- build the minimizer index ----
   timer.Start();
   if (two_pass) {
