@@ -59,6 +59,9 @@ struct Program_Parameters {
   // give up aligning a correction overlap once its edit distance exceeds this
   // fraction of its length (0: no limit)
   double max_edit_rate = 0.3;
+  // above this many bases of reads the minimizer index is built in two
+  // passes instead of keeping every read's minimizers (default 2^32)
+  std::uint64_t two_pass_index_bases = 1ULL << 32;
   // path to the precomputed FastK counts (used when --internal-count is off)
   std::string fastk_path = "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19";
 

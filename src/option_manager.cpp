@@ -48,6 +48,7 @@ enum program_opt {
   opt_dump_rf_scores,
   opt_anchor_spacing,
   opt_max_edit_rate,
+  opt_two_pass_index_above,
   opt_fastk_counts,
   opt_threads,
 
@@ -107,6 +108,7 @@ static struct option options[] = {
     {"dump-rf-scores", no_argument, nullptr, opt_dump_rf_scores},
     {"anchor-spacing", required_argument, nullptr, opt_anchor_spacing},
     {"max-edit-rate", required_argument, nullptr, opt_max_edit_rate},
+    {"two-pass-index-above", required_argument, nullptr, opt_two_pass_index_above},
     {"fastk-counts", required_argument, nullptr, opt_fastk_counts},
     {"threads", required_argument, nullptr, opt_threads},
 
@@ -265,6 +267,12 @@ void Help() {
             "      default: 0.3\n"
             "      reject a correction overlap once its edit distance exceeds this\n"
             "      fraction of its length; 0 aligns every overlap in full\n"
+            "    --two-pass-index-above <float>\n"
+            "      default: 4.29\n"
+            "      above this many gigabases of reads, count the minimizers while\n"
+            "      sketching and fill the index in a second pass instead of keeping\n"
+            "      every read's minimizers (less memory, ~2 extra minimizing passes);\n"
+            "      0 always does\n"
             "    --fastk-counts <string>\n"
             "      path to the precomputed FastK counts (used when --internal-count\n"
             "      is off); build FastK on the same reads for an apples-to-apples\n"
@@ -469,6 +477,10 @@ int ProcessParameters(int argc, char **argv, Program_Parameters& param) {
         break;
       case opt_max_edit_rate:
         param.max_edit_rate = std::atof(optarg);
+        break;
+      case opt_two_pass_index_above:
+        param.two_pass_index_bases =
+            static_cast<std::uint64_t>(std::atof(optarg) * 1e9);
         break;
       case opt_fastk_counts:
         param.fastk_path = optarg;

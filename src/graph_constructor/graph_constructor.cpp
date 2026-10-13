@@ -1829,19 +1829,28 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
   at::set_num_interop_threads(1);
   std::vector<std::vector<float>> all_features {};
 
+  // Set below: sketching also builds each read's minimizers (fused path).
+  // They are kept for the index and mapping, or, for a two-pass index, only
+  // counted into minimizer_counts and freed.
+  bool store_minimizers = false;
+  std::unique_ptr<ram::KmerCounter> minimizer_counts;
+
   auto sketch_sequence = [&](std::uint32_t i) -> void {
     std::vector<std::uint64_t> ids;
     std::vector<float> sketch;
     std::vector<std::uint32_t> avg_base_qualities;
     std::vector<std::uint32_t> min_base_qualities;
 
-    if (!param.minimizers && !param.no_fuse) {
+    if (store_minimizers) {
       // Fused: also builds and stores this read's minimizer sketch.
       minimizer_engine.SketchAndMinimizeFastK(
           sequences[i], 1U, ids, sketch, avg_base_qualities, min_base_qualities);
     } else {
       minimizer_engine.FastKSketchReadInto(
           sequences[i], 1U, ids, sketch, avg_base_qualities, min_base_qualities);
+    }
+    if (minimizer_counts) {
+      minimizer_engine.CountMinimizers(sequences[i], minimizer_counts.get());
     }
 
     if (!sketch.empty()) {
@@ -2325,70 +2334,82 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
               << peak << ") " << std::fixed << peak_timer.Stop() << "s" << std::endl;
   }
 
-  if (use_fused_fastk) {
+  // One minimizer index over all reads, and every read mapped against it once
+  // (Map keeps pairs with query id <= target id, so each pair is found once).
+  // Up to param.two_pass_index_bases the fused path keeps every read's
+  // minimizers from sketching for the index and mapping. Above it keeping
+  // them would cost ~16 B per minimizer of the whole read set, so sketching
+  // only counts them, the index is filled in a second minimizing pass and Map
+  // recomputes each read's.
+  std::uint64_t total_bases = 0;
+  for (const auto &it : sequences) {
+    total_bases += it->inflated_len;
+  }
+  const bool two_pass = total_bases > param.two_pass_index_bases;
+  store_minimizers = use_fused_fastk;
+  if (store_minimizers) {
     minimizer_engine.InitReadStore(sequences.size());
   }
-  for (std::uint32_t i = 0, j = 0; i < sequences.size(); ++i) {
-    bytes += sequences[i]->inflated_len;
-    if (i != sequences.size() - 1 && bytes < (1ULL << 32)) {
-      continue;
-    }
-    bytes = 0;
+  if (two_pass) {
+    // bloom sized at ~4x the minimizer instances (~14 bits per distinct one)
+    const std::uint64_t instances = 2 * total_bases / (param.window_len + 1);
+    minimizer_counts = std::make_unique<ram::KmerCounter>(
+        32, thread_pool_, /*min_count=*/2, /*bloom_capacity_hint=*/4 * instances);
+  }
 
-    const std::uint32_t block_start = j;
-
-    // ---- sketch first: feature extraction (+ fused minimizer construction,
-    //      which populates the per-read minimizer store) ----
-    timer.Start();
-    std::cerr << "Starting sketching" << std::endl;
+  // ---- sketch every read first: mapping computes features from the k-mer
+  //      types of both reads of an overlap ----
+  timer.Start();
+  std::cerr << "Starting sketching" << std::endl;
+  {
     std::vector<std::future<void>> sketch_futures;
-    for (std::uint32_t k = block_start; k < i + 1; ++k) {
+    sketch_futures.reserve(sequences.size());
+    for (std::uint32_t k = 0; k < sequences.size(); ++k) {
       sketch_futures.emplace_back(thread_pool_->Submit(sketch_sequence, k));
     }
     for (const auto &it : sketch_futures) {
       it.wait();
     }
-    sketch_futures.clear();
-    std::cerr << "[raven::Graph::Construct] sketched sequences "
-              << std::fixed << timer.Stop() << "s"
-              << std::endl;
+  }
+  std::cerr << "[raven::Graph::Construct] sketched sequences "
+            << std::fixed << timer.Stop() << "s"
+            << std::endl;
 
-    graph_.PrintPiles();
+  graph_.PrintPiles();
 
-    // ---- build the minimizer index (from stored sketches on the FastK path) ----
-    timer.Start();
-    if (use_fused_fastk) {
-      minimizer_engine.BuildIndexFromStored(
-        sequences.begin() + block_start,
-        sequences.begin() + i + 1);
-    } else {
-      minimizer_engine.Minimize(
-        sequences.begin() + block_start,
-        sequences.begin() + i + 1,
-        true);
-    }
+  // ---- build the minimizer index ----
+  timer.Start();
+  if (two_pass) {
+    minimizer_counts->Finalize();
+    std::cerr << "[raven::Graph::Construct] counted "
+              << minimizer_counts->num_distinct()
+              << " minimizers occurring more than once" << std::endl;
+    minimizer_engine.BuildIndexFromCounts(
+      *minimizer_counts, sequences.begin(), sequences.end());
+    minimizer_counts.reset();
+  } else if (store_minimizers) {
+    minimizer_engine.BuildIndexFromStored(sequences.begin(), sequences.end());
+  } else {
+    minimizer_engine.Minimize(sequences.begin(), sequences.end(), true);
+  }
 
-    minimizer_engine.Filter(param.freq);
+  minimizer_engine.Filter(param.freq);
 
-    std::cerr << "[raven::Graph::Construct] minimized "
-              << block_start << " - " << i + 1 << " / " << sequences.size() << " "
-              << std::fixed << timer.Stop() << "s"
-              << std::endl;
+  std::cerr << "[raven::Graph::Construct] minimized "
+            << sequences.size() << " sequences" << (two_pass ? " (two-pass index) " : " ")
+            << std::fixed << timer.Stop() << "s"
+            << std::endl;
 
-    std::vector<std::uint32_t> num_overlaps(extended_overlaps.size());
-    for (std::uint32_t k = 0; k < extended_overlaps.size(); ++k) {
-      num_overlaps[k] = extended_overlaps[k].size();
-    }
-
-    // ---- map ----
+  // ---- map every read against it ----
+  {
     std::vector<std::future<std::vector<extended_overlap>>> thread_futures;
 
     timer.Start();
-    for (std::uint32_t k = block_start; k < i + 1; ++k) {
+    for (std::uint32_t k = 0; k < sequences.size(); ++k) {
         thread_futures.emplace_back(thread_pool_->Submit(map_sequences, k));
 
         bytes += sequences[k]->inflated_len;
-        if (k != i && bytes < (1U << 30)) {
+        if (k != sequences.size() - 1 && bytes < (1U << 30)) {
           continue;
         }
         bytes = 0;
@@ -2408,15 +2429,11 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
                 << std::fixed << timer.Stop() << "s"
                 << std::endl;
     }
+  }
 
-    // ---- release this block's stored minimizers ----
-    if (use_fused_fastk) {
-      minimizer_engine.FreeReadStoreRange(
-        sequences.begin() + block_start,
-        sequences.begin() + i + 1);
-    }
-
-    j = i + 1;
+  // ---- release the stored minimizers ----
+  if (store_minimizers) {
+    minimizer_engine.ClearReadStore();
   }
 }
 
