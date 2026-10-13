@@ -1626,8 +1626,10 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
 
   graph_.annotations_.resize(sequences.size());
                                       
+  // The correction path reads only k-mer types and flags from piles, so they
+  // go without the per-base coverage.
   for (const auto &it : sequences) {
-    graph_.piles_.emplace_back(new Pile(it->id, it->inflated_len));
+    graph_.piles_.emplace_back(new Pile(it->id, it->inflated_len, /*coverage=*/false));
   }
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
@@ -1936,9 +1938,6 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     torch::Tensor pred = logits.argmax(1).squeeze(0).to(torch::kCPU);  // [L]
     auto pred_acc = pred.accessor<int64_t, 1>();
 
-    std::vector<kMerType> expanded_kmer_types;
-    expanded_kmer_types.reserve(ids.size());
-
     auto class_to_type = [](int64_t c) -> kMerType {
       switch (c) {
         case 0: return kMerType::Diploid;  // D
@@ -1948,28 +1947,14 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       }
     };
 
-    // Expand each window prediction to 10 positions
+    // One class per window of 10 positions; positions past the last window
+    // take its class. The pile keeps them per window (1 B per 10 positions).
+    std::vector<kMerType> window_types(L);
     for (int64_t w = 0; w < L; ++w) {
-      kMerType t = class_to_type(pred_acc[w]);
-
-      for (std::uint32_t r = 0; r < 10; ++r) {
-        if (expanded_kmer_types.size() >= ids.size()) break;
-        expanded_kmer_types.push_back(t);
-      }
+      window_types[w] = class_to_type(pred_acc[w]);
     }
-
-    // ---------------------------------------------------------
-    // Tail handling: repeat LAST classification
-    // ---------------------------------------------------------
-    kMerType tail = expanded_kmer_types.empty()
-                        ? kMerType::None
-                        : expanded_kmer_types.back();
-
-    while (expanded_kmer_types.size() < ids.size()) {
-      expanded_kmer_types.push_back(tail);
-    }
-
-    graph_.piles_[i]->set_k_mer_types(expanded_kmer_types);
+    graph_.piles_[i]->set_k_mer_type_windows(
+        std::move(window_types), 10, ids.size());
 
     // Prevent potential optimization removal
     volatile float sink = logits.reshape({-1})[0].item<float>();

@@ -3,6 +3,7 @@
 #ifndef RAVEN_PILE_HPP_
 #define RAVEN_PILE_HPP_
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -23,7 +24,10 @@ namespace raven {
   enum class kMerType : std::uint8_t { Haploid = 0, Diploid = 1, Error = 2, Repetitive = 3, None = 4 };
   class Pile {
   public:
-    Pile(std::uint32_t id, std::uint32_t len);
+    // coverage: allocate the per-base coverage (2 B per base) that the
+    // assembly path's layers, median and region finding use; the correction
+    // path uses only k-mer types and flags.
+    Pile(std::uint32_t id, std::uint32_t len, bool coverage = true);
 
     Pile(const Pile &) = delete;
 
@@ -43,83 +47,34 @@ namespace raven {
       return k_mer_ids_;
     }
 
+    // per k-mer position (expanded from the stored windows)
     std::vector<kMerType> get_kmer_types() const {
-      return kmer_types_;
+      std::vector<kMerType> types(num_kmer_types_);
+      for (std::uint32_t i = 0; i < num_kmer_types_; ++i) {
+        types[i] = kmer_type_at(i);
+      }
+      return types;
     }
 
     float return_repetitve(std::uint32_t start, std::uint32_t end){
-      if(kmer_types_.empty() || start >= end || end > kmer_types_.size()){
-        return 0.0;
-    }
-
-      float total = 0.0;
-      for(std::uint32_t i = start; i < end; ++i){
-        if(kmer_types_[i] == kMerType::Repetitive){
-          total += 1.0;
-        }
-      }
-      return total / (end - start);
+      return kmer_type_fraction(start, end, kMerType::Repetitive);
     }
 
     float return_haploid(std::uint32_t start, std::uint32_t end){
-      if(kmer_types_.empty() || start >= end || end > kmer_types_.size()){
-        return 0.0;
-      }
-
-      float total = 0.0;
-      for(std::uint32_t i = start; i < end; ++i){
-        if(kmer_types_[i] == kMerType::Haploid){
-          total += 1.0;
-        }
-      }
-      return total / (end - start);
+      return kmer_type_fraction(start, end, kMerType::Haploid);
     }
-    
+
     float return_diploid(std::uint32_t start, std::uint32_t end){
-      if(kmer_types_.empty() || start >= end || end > kmer_types_.size()){
-        return 0.0;
-      }
-
-      float total = 0.0;
-      for(std::uint32_t i = start; i < end; ++i){
-        if(kmer_types_[i] == kMerType::Diploid){
-          total += 1.0;
-        }
-      }
-      return total / (end - start);
-
+      return kmer_type_fraction(start, end, kMerType::Diploid);
     }
 
     float return_erroneous(std::uint32_t start, std::uint32_t end){
-
-      if(kmer_types_.empty() || start >= end || end > kmer_types_.size()){
-        return 0.0;
-      }
-
-      float total = 0.0;
-      for(std::uint32_t i = start; i < end; ++i){
-        if(kmer_types_[i] == kMerType::Error){
-          total += 1.0;
-        }
-      }
-      return total / (end - start);
+      return kmer_type_fraction(start, end, kMerType::Error);
     }
-
 
     float return_ratio(std::uint32_t start, uint32_t end, kMerType kmer_type){
-      if(kmer_types_.empty() || start >= end || end > kmer_types_.size()){
-        return 0.0;
-      }
-
-      float total = 0.0;
-      for(std::uint32_t i = start; i < end; ++i){
-        if(kmer_types_[i] == kmer_type){
-          total += 1.0;
-        }
-      }
-      return total / (end - start);
+      return kmer_type_fraction(start, end, kmer_type);
     }
-
 
     std::uint32_t id() const {
       return id_;
@@ -193,12 +148,27 @@ namespace raven {
       hor_percent_ = p;
     }
 
+    // one type per k-mer position
     void set_k_mer_types(std::vector<kMerType> tmp){
-      kmer_types_ = tmp;
+      num_kmer_types_ = tmp.size();
+      kmer_types_ = std::move(tmp);
+      kmer_type_window_ = 1;
+    }
+
+    // One type per `window` k-mer positions (the CNN's per-window classes),
+    // for num_positions positions; positions past the last window take its
+    // type. 1/window of the memory of set_k_mer_types, same lookups.
+    void set_k_mer_type_windows(std::vector<kMerType> windows,
+                                std::uint32_t window,
+                                std::uint32_t num_positions){
+      kmer_types_ = std::move(windows);
+      kmer_type_window_ = window;
+      num_kmer_types_ = kmer_types_.empty() ? 0 : num_positions;
     }
 
     void clear_k_mer_types(){
-      kmer_types_.clear();
+      std::vector<kMerType>().swap(kmer_types_);
+      num_kmer_types_ = 0;
     }
 
     void set_backbone(){
@@ -319,7 +289,52 @@ namespace raven {
     std::vector<std::uint16_t> data_;
     std::vector<std::uint64_t> k_mer_ids_;
     std::vector<bool> kmers_;
+    // k-mer types, one per kmer_type_window_ positions, for num_kmer_types_
+    // positions
     std::vector<kMerType> kmer_types_;
+    std::uint32_t kmer_type_window_ = 1;
+    std::uint32_t num_kmer_types_ = 0;
+
+    kMerType kmer_type_at(std::uint32_t i) const {
+      const std::size_t w = std::min<std::size_t>(i / kmer_type_window_,
+                                                  kmer_types_.size() - 1);
+      return kmer_types_[w];
+    }
+
+    // f(first, last, type) for consecutive runs of positions in [first, last]
+    // (last < num_kmer_types_) that share a window, hence a type
+    template <typename F>
+    void for_each_kmer_type_segment(std::uint32_t first, std::uint32_t last,
+                                    F f) const {
+      const std::size_t last_window = kmer_types_.size() - 1;
+      for (std::uint32_t i = first; i <= last;) {
+        const std::size_t w = std::min<std::size_t>(i / kmer_type_window_, last_window);
+        const std::uint32_t segment_last = w == last_window ?
+            last :
+            std::min<std::uint32_t>(last, (w + 1) * kmer_type_window_ - 1);
+        f(i, segment_last, kmer_types_[w]);
+        if (segment_last == last) {
+          break;
+        }
+        i = segment_last + 1;
+      }
+    }
+
+    // fraction of positions in [start, end) of the given type
+    float kmer_type_fraction(std::uint32_t start, std::uint32_t end,
+                             kMerType type) const {
+      if (num_kmer_types_ == 0 || start >= end || end > num_kmer_types_) {
+        return 0.0;
+      }
+      std::uint32_t total = 0;
+      for_each_kmer_type_segment(start, end - 1,
+          [&](std::uint32_t a, std::uint32_t b, kMerType t) {
+            if (t == type) {
+              total += b - a + 1;
+            }
+          });
+      return static_cast<float>(total) / (end - start);
+    }
     std::vector<Region> chimeric_regions_;
     std::vector<Region> repetitive_regions_;
     bool backbone_pile_;

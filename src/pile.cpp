@@ -20,7 +20,7 @@ namespace raven {
 
   //enum class kMerType : std::uint8_t { Haploid = 0, Diploid = 1, Repetitive = 2, Error = 3 };
 
-  Pile::Pile(std::uint32_t id, std::uint32_t len)
+  Pile::Pile(std::uint32_t id, std::uint32_t len, bool coverage)
       : id_(id),
         begin_(0),
         end_(len),
@@ -30,7 +30,7 @@ namespace raven {
         is_chimeric_(0),
         is_repetitive_(0),
         is_hor_(0),
-        data_(end_, 0),
+        data_(coverage ? end_ : 0, 0),
         k_mer_ids_(),
         kmers_(),
         chimeric_regions_(),
@@ -79,22 +79,42 @@ namespace raven {
   }
 
 std::vector<std::pair<std::uint32_t, std::uint32_t>> Pile::find_region_positions(kMerType type, std::uint32_t span_start, std::uint32_t span_end){
+    // Runs of `type` in [span_start, span_end] (span_end == -1: to the last
+    // position), as a per-position scan that emits a run when the next
+    // position differs. Kept exactly, quirks included, since overlap features
+    // the RF was trained on come from it: a run still open at span_end is not
+    // emitted, and a run of one position keeps the previous run's end (or 0).
+    // Walks segments of positions sharing a type window instead of positions.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> positions;
+    if (num_kmer_types_ == 0) {
+      return positions;
+    }
+    const std::uint32_t last = std::min<std::uint32_t>(
+        span_end == static_cast<std::uint32_t>(-1) ? num_kmer_types_ - 1 : span_end,
+        num_kmer_types_ - 1);
+    if (span_start > last) {
+      return positions;
+    }
     bool region = false;
     std::uint32_t start = 0;
     std::uint32_t end = 0;
-    for(std::uint32_t i = span_start; i <= (span_end == -1 ? (kmer_types_.size() - 1) : span_end); i++){
-      if((kmer_types_[i] == type) && (region == false)){
-        start = i;
-        region = true;
-      } else if ((kmer_types_[i] == type) && (region == true))
-      {
-        end = i;
-      } else if ((kmer_types_[i] != type) && (region == true)){
-        region = false;
-        positions.emplace_back(std::pair(start, end));
-      }
-    }
+    for_each_kmer_type_segment(span_start, last,
+        [&](std::uint32_t a, std::uint32_t b, kMerType t) {
+          if (t == type) {
+            if (!region) {
+              start = a;
+              region = true;
+              if (b > a) {
+                end = b;
+              }
+            } else {
+              end = b;
+            }
+          } else if (region) {
+            region = false;
+            positions.emplace_back(start, end);
+          }
+        });
     return positions;
 };
 
