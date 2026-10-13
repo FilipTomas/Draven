@@ -492,6 +492,29 @@ void Graph_Constructor::Construct(
   std::_Exit(0);
 }
 
+// Log what the overlap piles hold: entries, and bytes of the structs (by
+// capacity), their anchors and their CIGARs.
+static void LogOverlapMemory(
+    const std::vector<std::vector<extended_overlap>> &piles, const char *when) {
+  std::uint64_t entries = 0, structs = 0, anchors = 0, cigars = 0;
+  for (const auto &pile : piles) {
+    entries += pile.size();
+    structs += pile.capacity() * sizeof(extended_overlap);
+    for (const auto &it : pile) {
+      anchors += it.anchors.capacity() * sizeof(it.anchors[0]) +
+                 it.gap_positions.capacity() * sizeof(it.gap_positions[0]);
+      if (it.edlib_alignment.cigar.capacity() > 15) {  // past the in-place buffer
+        cigars += it.edlib_alignment.cigar.capacity();
+      }
+    }
+  }
+  const double gb = 1024.0 * 1024.0 * 1024.0;
+  std::cerr << std::fixed << std::setprecision(2)
+            << "[raven::] overlaps " << when << ": " << entries << " entries, "
+            << structs / gb << " GB structs + " << anchors / gb << " GB anchors + "
+            << cigars / gb << " GB CIGARs" << std::endl;
+}
+
 void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, Program_Parameters &param){
     std::vector<std::vector<extended_overlap>> extended_overlaps(sequences.size());
     biosoup::Timer timer{};
@@ -520,9 +543,12 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
         ExitWithoutTeardown();
       }
 
+      LogOverlapMemory(extended_overlaps, "before selection");
       SelectCorrectionOverlaps(sequences, extended_overlaps, param);
+      LogOverlapMemory(extended_overlaps, "after selection");
       AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
                           param.max_edit_rate);
+      LogOverlapMemory(extended_overlaps, "after alignment");
     } else {
       LoadOverlapsAndAlign(param, sequences, extended_overlaps);
     }
@@ -1633,6 +1659,7 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
   }
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
+  LogOverlapMemory(extended_overlaps, "after mapping");
 
   if (param.dump_all_overlaps) {
     // Debug: raw ram overlaps (all fragments, no dedup/merge/features) are now
