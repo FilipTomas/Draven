@@ -1659,6 +1659,26 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
   }
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
+
+  // After mapping, nothing on the correction path reads k-mer counts.
+  internal_counter_.reset();
+
+  // Piles grew one overlap at a time; give back their spare capacity.
+  {
+    std::vector<std::future<void>> futures;
+    futures.reserve(extended_overlaps.size());
+    for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
+      futures.emplace_back(thread_pool_->Submit([&](std::uint32_t j) -> void {
+        extended_overlaps[j].shrink_to_fit();
+        for (auto &it : extended_overlaps[j]) {
+          it.anchors.shrink_to_fit();
+        }
+      }, i));
+    }
+    for (const auto &it : futures) {
+      it.wait();
+    }
+  }
   LogOverlapMemory(extended_overlaps, "after mapping");
 
   if (param.dump_all_overlaps) {
