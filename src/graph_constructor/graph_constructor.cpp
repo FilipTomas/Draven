@@ -676,6 +676,10 @@ void Graph_Constructor::SelectCorrectionOverlaps(
   std::uint64_t candidates = 0;
   std::uint64_t kept = 0;
   std::uint64_t skipped = 0;
+  // kept overlaps whose support read is strongly contained: in the target,
+  // or overlapping it otherwise (dovetail, or containing it)
+  std::uint64_t kept_contained_support = 0;
+  std::uint64_t kept_dovetail_contained_support = 0;
 
   for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
     std::vector<extended_overlap> pile;
@@ -709,6 +713,12 @@ void Graph_Constructor::SelectCorrectionOverlaps(
 
       extended_overlaps[i].emplace_back(std::move(total_ovlp));
       ++kept;
+      if (graph_.piles_[o.rhs_id]->is_strong_contained()) {
+        const std::uint32_t type = overlap_type_extended(
+            o, graph_, sequences[o.lhs_id]->inflated_len,
+            sequences[o.rhs_id]->inflated_len);
+        ++(type == 2 ? kept_contained_support : kept_dovetail_contained_support);
+      }
     }
   }
 
@@ -719,6 +729,10 @@ void Graph_Constructor::SelectCorrectionOverlaps(
             << (param.rf_require_full_window ? ", full-window" : ", any-overlap")
             << ", skipped " << skipped << " invalid, "
             << std::fixed << timer.Stop() << "s" << std::endl;
+  std::cerr << "[raven::SelectCorrectionOverlaps] kept overlaps with a strongly "
+               "contained support read: " << kept_contained_support
+            << " contained in the target, " << kept_dovetail_contained_support
+            << " otherwise" << std::endl;
 }
 
 // void Graph_Constructor::LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps){
@@ -1678,6 +1692,13 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
     graph_.piles_.emplace_back(new Pile(it->id, it->inflated_len, /*coverage=*/false));
   }
 
+  // Containment votes are applied as mapping stores overlaps, so piles of
+  // reads that become strongly contained are freed during mapping.
+  if (!param.dump_all_overlaps) {
+    containment_votes_.assign(sequences.size(), 0);
+    containment_threshold_ = 3;
+  }
+
   MapSequencesFast(sequences, extended_overlaps, timer, param);
 
   // After mapping, nothing on the correction path reads k-mer counts.
@@ -1716,7 +1737,7 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
   //           << std::endl;
   // exit(0);
 
-  ResolveContainedReads(sequences, extended_overlaps, timer, 3);
+  ResolveContainedReads(sequences, extended_overlaps, timer, containment_threshold_);
 
   std::cerr << "Resolved Contained!" << std::endl;
   //graph_.PrintOverlaps(extended_overlaps, sequences, true, param.paf_after_contained_filename);
@@ -2133,6 +2154,14 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
                             !param.dump_all_overlaps &&
                             !param.dump_overlaps_only;
 
+  // Correction path: containment votes are applied as overlaps are stored
+  // (StoreCorrectionCandidate), so a read at the threshold is final.
+  const bool tracking_containment = !containment_votes_.empty();
+  auto is_contained = [&](std::uint32_t id) -> bool {
+    return __atomic_load_n(&containment_votes_[id], __ATOMIC_RELAXED) >=
+           containment_threshold_;
+  };
+
   auto map_sequences = [&](std::uint32_t i) -> std::vector<extended_overlap> { // map sequences
   //auto map_sequences = [&](std::uint32_t i) -> std::vector<std::vector<float>> { // map sequences
     std::vector<biosoup::Overlap> ovlps;
@@ -2194,6 +2223,12 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       std::vector<biosoup::Overlap> tmp;
 
       for (auto &ovlp : no_dups_overlaps) {
+
+        // Both reads already strongly contained: neither pile is corrected and
+        // the overlap's votes and backbone marks go to contained reads only.
+        if (tracking_containment && is_contained(i) && is_contained(ovlp.rhs_id)) {
+          continue;
+        }
 
         // before extrapolation: anchors are looked up by the found span
         std::vector<std::pair<std::uint32_t, std::uint32_t>> anchors;
@@ -2475,7 +2510,13 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         bytes = 0;
 
         for (auto &it : thread_futures) {
-          for (const auto &jt : it.get()) {
+          for (auto &jt : it.get()) {
+            if (tracking_containment) {
+              extended_overlap reversed = feature_overlap_reverse(jt);
+              StoreCorrectionCandidate(std::move(jt), extended_overlaps, sequences);
+              StoreCorrectionCandidate(std::move(reversed), extended_overlaps, sequences);
+              continue;
+            }
             extended_overlaps[jt.overlap.lhs_id].emplace_back(jt);
             // In raw-dump mode keep each fragment once, oriented with read i
             // (lhs) as query -- no reversed copy on the target pile.
@@ -2893,6 +2934,80 @@ void Graph_Constructor::ResolveOverlapType(std::vector<std::unique_ptr<biosoup::
             << std::endl;
 } */
 
+// --------------------------------------------------
+// PASS 1 of ResolveContainedReads for one overlap copy:
+// Use only strong overlaps (classification_label == 1)
+// to detect containment and mark backbone reads.
+// Label-2 (HOR) overlaps are never marked as contained.
+// Returns the read that got a containment vote, or -1.
+// --------------------------------------------------
+std::uint32_t Graph_Constructor::ApplyContainmentPass1(
+    extended_overlap& ext_ovlp,
+    const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
+    std::uint32_t* containment_votes) {
+
+  ext_ovlp.cat = overlapCategory::None;
+
+  if (ext_ovlp.classification_label != 1 &&
+      ext_ovlp.classification_label != 2) {
+    return -1;
+  }
+
+  std::uint32_t lhs_id = ext_ovlp.overlap.lhs_id;
+  std::uint32_t rhs_id = ext_ovlp.overlap.rhs_id;
+
+  std::uint32_t type = overlap_type_extended(
+      ext_ovlp.overlap,
+      graph_,
+      sequences[lhs_id]->inflated_len,
+      sequences[rhs_id]->inflated_len);
+
+  ext_ovlp.graph_overlap_type = type;
+
+  if (ext_ovlp.classification_label == 2) {
+    // HOR overlap — never mark as contained, always backbone
+    ext_ovlp.cat = overlapCategory::Backbone;
+    graph_.piles_[lhs_id]->set_backbone();
+    graph_.piles_[rhs_id]->set_backbone();
+    return -1;
+  }
+  // label == 1 — vote-based containment logic (votes are read by mapping
+  // workers while the main thread adds them)
+  if (type == 1) {
+    __atomic_fetch_add(&containment_votes[lhs_id], 1U, __ATOMIC_RELAXED);
+    ext_ovlp.cat = overlapCategory::StrongContained;
+    return lhs_id;
+  }
+  if (type == 2) {
+    __atomic_fetch_add(&containment_votes[rhs_id], 1U, __ATOMIC_RELAXED);
+    ext_ovlp.cat = overlapCategory::StrongContained;
+    return rhs_id;
+  }
+  ext_ovlp.cat = overlapCategory::Backbone;
+  graph_.piles_[lhs_id]->set_backbone();
+  graph_.piles_[rhs_id]->set_backbone();
+  return -1;
+}
+
+void Graph_Constructor::StoreCorrectionCandidate(
+    extended_overlap&& ext_ovlp,
+    std::vector<std::vector<extended_overlap>>& extended_overlaps,
+    const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences) {
+  const std::uint32_t voted =
+      ApplyContainmentPass1(ext_ovlp, sequences, containment_votes_.data());
+  // Votes only grow, so a read at the threshold stays strongly contained
+  // and its pile is never corrected: free it once, store nothing more in it.
+  if (voted != static_cast<std::uint32_t>(-1) &&
+      containment_votes_[voted] == containment_threshold_) {
+    std::vector<extended_overlap>().swap(extended_overlaps[voted]);
+  }
+  const std::uint32_t pile = ext_ovlp.overlap.lhs_id;
+  if (containment_votes_[pile] >= containment_threshold_) {
+    return;
+  }
+  extended_overlaps[pile].emplace_back(std::move(ext_ovlp));
+}
+
 void Graph_Constructor::ResolveContainedReads(
     std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
     std::vector<std::vector<extended_overlap>>& extended_overlaps,
@@ -2901,56 +3016,17 @@ void Graph_Constructor::ResolveContainedReads(
 
   timer.Start();
 
-  // --------------------------------------------------
-  // PASS 1:
-  // Use only strong overlaps (classification_label == 1)
-  // to detect containment and mark backbone reads.
-  // Label-2 (HOR) overlaps are never marked as contained.
-  // A read is only marked as contained if it receives
-  // at least containment_threshold votes.
-  // --------------------------------------------------
-  std::vector<std::uint32_t> containment_votes(sequences.size(), 0);
-
-  for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
-    for (std::uint32_t j = 0; j < extended_overlaps[i].size(); ++j) {
-
-      auto& ext_ovlp = extended_overlaps[i][j];
-      ext_ovlp.cat = overlapCategory::None;
-
-      if (ext_ovlp.classification_label != 1 &&
-          ext_ovlp.classification_label != 2) {
-        continue;
-      }
-
-      std::uint32_t lhs_id = ext_ovlp.overlap.lhs_id;
-      std::uint32_t rhs_id = ext_ovlp.overlap.rhs_id;
-
-      std::uint32_t type = overlap_type_extended(
-          ext_ovlp.overlap,
-          graph_,
-          sequences[lhs_id]->inflated_len,
-          sequences[rhs_id]->inflated_len);
-
-      ext_ovlp.graph_overlap_type = type;
-
-      if (ext_ovlp.classification_label == 2) {
-        // HOR overlap — never mark as contained, always backbone
-        ext_ovlp.cat = overlapCategory::Backbone;
-        graph_.piles_[lhs_id]->set_backbone();
-        graph_.piles_[rhs_id]->set_backbone();
-      } else {
-        // label == 1 — vote-based containment logic
-        if (type == 1) {
-          containment_votes[lhs_id]++;
-          ext_ovlp.cat = overlapCategory::StrongContained;
-        } else if (type == 2) {
-          containment_votes[rhs_id]++;
-          ext_ovlp.cat = overlapCategory::StrongContained;
-        } else {
-          ext_ovlp.cat = overlapCategory::Backbone;
-          graph_.piles_[lhs_id]->set_backbone();
-          graph_.piles_[rhs_id]->set_backbone();
-        }
+  // PASS 1, unless already applied to every overlap as mapping stored it
+  // (then piles of contained reads are already empty).
+  std::vector<std::uint32_t> containment_votes;
+  if (!containment_votes_.empty()) {
+    containment_votes.swap(containment_votes_);
+  } else {
+    containment_votes.assign(sequences.size(), 0);
+    for (std::uint32_t i = 0; i < extended_overlaps.size(); ++i) {
+      for (std::uint32_t j = 0; j < extended_overlaps[i].size(); ++j) {
+        ApplyContainmentPass1(extended_overlaps[i][j], sequences,
+                              containment_votes.data());
       }
     }
   }

@@ -132,6 +132,18 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
                             std::vector<std::vector<extended_overlap>>& extended_overlaps,
                             biosoup::Timer& timer,
                             std::uint32_t containment_threshold);
+  // PASS 1 of ResolveContainedReads for one overlap copy (overlap type,
+  // containment votes, backbone marks); returns the read that got a vote, or -1.
+  std::uint32_t ApplyContainmentPass1(
+      extended_overlap& ext_ovlp,
+      const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
+      std::uint32_t* containment_votes);
+  // Correction mapping: apply PASS 1 to a copy as it is stored, and keep no
+  // overlaps in the piles of reads that have reached the containment threshold.
+  void StoreCorrectionCandidate(
+      extended_overlap&& ext_ovlp,
+      std::vector<std::vector<extended_overlap>>& extended_overlaps,
+      const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences);
   void ResolveContainedReadsGT(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                               std::vector<std::vector<extended_overlap>> &extended_overlaps,
                               biosoup::Timer &timer);
@@ -161,6 +173,10 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
   std::shared_ptr<thread_pool::ThreadPool> thread_pool_;
   // Populated by LoadAndCount (overlapped load+count); reused by MapSequencesFast.
   std::unique_ptr<ram::KmerCounter> internal_counter_;
+  // Correction path: containment votes applied while mapping stores overlaps
+  // (empty when not tracking), and the threshold for strong containment.
+  std::vector<std::uint32_t> containment_votes_;
+  std::uint32_t containment_threshold_ = 3;
 
   double disagreement_;
 };
