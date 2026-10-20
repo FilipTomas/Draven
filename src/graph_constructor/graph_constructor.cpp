@@ -1,5 +1,7 @@
 
 #include <algorithm>
+#include <chrono>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <cstdio>
@@ -1885,6 +1887,20 @@ std::vector<std::pair<std::uint64_t, std::uint16_t>> window_min(const std::vecto
   return mins;   // one value per w_size window
 }
 
+namespace {
+
+std::uint64_t ClockNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Time and k-mers of the Jaccard k-mer collection on this thread, added to
+// the mapping totals as each mapping call returns.
+thread_local std::uint64_t tl_kmer_ns = 0;
+thread_local std::uint64_t tl_kmers = 0;
+
+}  // namespace
+
 void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                      std::vector<std::vector<extended_overlap>> &extended_overlaps,
                                      biosoup::Timer &timer,
@@ -2081,9 +2097,35 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
   // Gather the k-mer ids of the given regions of a pile into one sorted, deduped
   // vector (replaces per-region std::set construction + merging).
+  // CPU time of the mapping phases summed over threads (ns), and counts,
+  // for the log at the end of mapping
+  enum MapPhase { kMapIndex, kMapMerge, kMapAnchors, kMapFeatures, kMapKmers, kMapStore, kNumMapPhases };
+  std::array<std::atomic<std::uint64_t>, kNumMapPhases> phase_ns{};
+  std::atomic<std::uint64_t> phase_overlaps{0};
+  std::atomic<std::uint64_t> phase_kmers{0};
+  // a mapping call's phase times, added to the totals when it returns
+  struct PhaseTimes {
+    std::array<std::atomic<std::uint64_t>, kNumMapPhases>& totals;
+    std::atomic<std::uint64_t>& overlaps;
+    std::atomic<std::uint64_t>& kmers;
+    std::array<std::uint64_t, kNumMapPhases> ns{};
+    std::uint64_t num_overlaps = 0;
+    ~PhaseTimes() {
+      ns[kMapKmers] += tl_kmer_ns;
+      kmers += tl_kmers;
+      tl_kmer_ns = 0;
+      tl_kmers = 0;
+      for (std::size_t p = 0; p < ns.size(); ++p) {
+        if (ns[p]) totals[p] += ns[p];
+      }
+      overlaps += num_overlaps;
+    }
+  };
+
   auto collect_sorted_kmers =[&](std::uint32_t pile_id,
       const std::vector<std::pair<std::uint32_t, std::uint32_t>>& positions)
       -> std::vector<std::uint64_t>{
+    const std::uint64_t collect_start = ClockNs();
     std::vector<std::uint64_t> kmers;
     for(const auto& p : positions){
       if (param.store_kmer_ids) {
@@ -2093,8 +2135,10 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         minimizer_engine.KmerIdsInRegion(*sequences[pile_id], p.first, p.second, kmers);
       }
     }
+    tl_kmers += kmers.size();
     std::sort(kmers.begin(), kmers.end());
     kmers.erase(std::unique(kmers.begin(), kmers.end()), kmers.end());
+    tl_kmer_ns += ClockNs() - collect_start;
     return kmers;
   };
 
@@ -2164,6 +2208,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
   auto map_sequences = [&](std::uint32_t i) -> std::vector<extended_overlap> { // map sequences
   //auto map_sequences = [&](std::uint32_t i) -> std::vector<std::vector<float>> { // map sequences
+    PhaseTimes phase{phase_ns, phase_overlaps, phase_kmers};
+    std::uint64_t phase_start = ClockNs();
     std::vector<biosoup::Overlap> ovlps;
     std::vector<ram::MinimizerEngine::Anchors> ovlp_anchors;
     auto *anchors_out = keep_anchors ? &ovlp_anchors : nullptr;
@@ -2174,6 +2220,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       ovlps = minimizer_engine.Map(sequences[i], true, true,
                                                                 false, nullptr, anchors_out);
     }
+    phase.ns[kMapIndex] += ClockNs() - phase_start;
     // ovlps is reordered below; keep the fragments ovlp_anchors is indexed by
     std::vector<biosoup::Overlap> fragments;
     if (keep_anchors) {
@@ -2207,6 +2254,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
       std::vector<biosoup::Overlap> no_dups_overlaps;
       std::vector<std::vector<float>> features {};
         
+      phase_start = ClockNs();
       if (param.merge_fragments) {
         // Merge collinear fragments per pair -> outermost-anchor span.
         no_dups_overlaps = merge_fragments(ovlps);
@@ -2219,6 +2267,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
             });
         no_dups_overlaps = remove_duplicates(ovlps);
       }
+      phase.ns[kMapMerge] += ClockNs() - phase_start;
 
       std::vector<biosoup::Overlap> tmp;
 
@@ -2231,11 +2280,14 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         }
 
         // before extrapolation: anchors are looked up by the found span
+        phase_start = ClockNs();
         std::vector<std::pair<std::uint32_t, std::uint32_t>> anchors;
         if (keep_anchors) {
           anchors = collect_anchors(ovlp, fragments, ovlp_anchors,
                                     param.anchor_spacing);
         }
+        const std::uint64_t features_start = ClockNs();
+        phase.ns[kMapAnchors] += features_start - phase_start;
 
         std::uint32_t left_overhang = 0;
         std::uint32_t right_overhang = 0;
@@ -2345,6 +2397,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
             }
         }
         ovlps_final.emplace_back(total_ovlp);
+        phase.ns[kMapFeatures] += ClockNs() - features_start;
+        ++phase.num_overlaps;
 
       }
       return ovlps_final;
@@ -2509,8 +2563,11 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         }
         bytes = 0;
 
+        std::uint64_t store_ns = 0;
         for (auto &it : thread_futures) {
-          for (auto &jt : it.get()) {
+          auto batch = it.get();
+          const std::uint64_t store_start = ClockNs();
+          for (auto &jt : batch) {
             if (tracking_containment) {
               extended_overlap reversed = feature_overlap_reverse(jt);
               StoreCorrectionCandidate(std::move(jt), extended_overlaps, sequences);
@@ -2524,13 +2581,30 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
               extended_overlaps[jt.overlap.rhs_id].emplace_back(feature_overlap_reverse(jt));
             }
           }
+          store_ns += ClockNs() - store_start;
         }
+        phase_ns[kMapStore] += store_ns;
         thread_futures.clear();
-      std::cerr << "[raven::Graph::Construct] mapped sequences "
+      std::cerr << "[raven::Graph::Construct] mapped sequences " << k + 1
+                << " / " << sequences.size() << " "
                 << std::fixed << timer.Stop() << "s"
                 << std::endl;
+      timer.Start();
     }
+    timer.Stop();
   }
+
+  const double s_per_ns = 1e-9;
+  std::cerr << std::fixed << std::setprecision(1)
+            << "[raven::Graph::Construct] mapping CPU s by phase: index+chaining "
+            << phase_ns[kMapIndex] * s_per_ns << ", merging "
+            << phase_ns[kMapMerge] * s_per_ns << ", anchors "
+            << phase_ns[kMapAnchors] * s_per_ns << ", features "
+            << phase_ns[kMapFeatures] * s_per_ns << " (Jaccard k-mers "
+            << phase_ns[kMapKmers] * s_per_ns << ", " << phase_kmers
+            << " k-mers), storing " << phase_ns[kMapStore] * s_per_ns
+            << " (main thread); " << phase_overlaps << " overlaps"
+            << std::endl;
 
   // ---- release the stored minimizers ----
   if (store_minimizers) {
