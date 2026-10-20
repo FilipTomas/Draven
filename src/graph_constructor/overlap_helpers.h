@@ -109,7 +109,9 @@ inline extended_overlap cigar_extended_overlap_reverse(const extended_overlap &e
 }
 
 inline extended_overlap feature_overlap_reverse(const extended_overlap &eo) {
-  extended_overlap res;
+  // value-initialized: fields not copied below (graph_overlap_type, set only
+  // for strong overlaps, the alignment fields, ...) are 0 as in a forward copy
+  extended_overlap res{};
   res.overlap.lhs_id = eo.overlap.rhs_id;
   res.overlap.lhs_begin = eo.overlap.rhs_begin;
   res.overlap.lhs_end = eo.overlap.rhs_end;
