@@ -276,8 +276,10 @@ inline std::uint32_t overlap_type(const biosoup::Overlap &o, raven::Graph &graph
 }
 
 
+// O: biosoup::Overlap, or anything with its coordinate and strand fields
+template <typename O>
 inline std::uint32_t overlap_type_extended(
-    const biosoup::Overlap& o,
+    const O& o,
     raven::Graph& graph,
     std::uint32_t lhs_length,
     std::uint32_t rhs_length) {

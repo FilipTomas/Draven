@@ -10,6 +10,7 @@
 #include "option_manager.h"
 #include "biosoup/timer.hpp"
 #include "ram/kmer_counter.hpp"
+#include "correction_candidate.h"
 #include <numeric>
 
 namespace raven {
@@ -133,17 +134,22 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
                             biosoup::Timer& timer,
                             std::uint32_t containment_threshold);
   // PASS 1 of ResolveContainedReads for one overlap copy (overlap type,
-  // containment votes, backbone marks); returns the read that got a vote, or -1.
+  // containment votes, backbone marks); returns the read that got a vote, or
+  // -1. Candidate: extended_overlap or correction_candidate.
+  template <typename Candidate>
   std::uint32_t ApplyContainmentPass1(
-      extended_overlap& ext_ovlp,
+      Candidate& ext_ovlp,
       const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
       std::uint32_t* containment_votes);
-  // Correction mapping: apply PASS 1 to a copy as it is stored, and keep no
-  // overlaps in the piles of reads that have reached the containment threshold.
+  // Correction mapping: apply PASS 1 to a copy as it is stored in
+  // correction_candidates_, keeping nothing in the piles of reads that have
+  // reached the containment threshold.
   void StoreCorrectionCandidate(
-      extended_overlap&& ext_ovlp,
-      std::vector<std::vector<extended_overlap>>& extended_overlaps,
+      correction_candidate&& candidate,
       const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences);
+  // Correction path: what ResolveContainedReads does after PASS 1, which ran
+  // as mapping stored the candidates (its PASS 2 categories go unused here).
+  void ResolveContainedCandidates(biosoup::Timer& timer);
   void ResolveContainedReadsGT(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                               std::vector<std::vector<extended_overlap>> &extended_overlaps,
                               biosoup::Timer &timer);
@@ -177,6 +183,8 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
   // (empty when not tracking), and the threshold for strong containment.
   std::vector<std::uint32_t> containment_votes_;
   std::uint32_t containment_threshold_ = 3;
+  // Correction path: candidate overlaps per read, from mapping to selection
+  std::vector<std::vector<correction_candidate>> correction_candidates_;
 
   double disagreement_;
 };
