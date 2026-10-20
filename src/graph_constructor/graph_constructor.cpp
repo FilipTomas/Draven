@@ -1899,6 +1899,52 @@ std::uint64_t ClockNs() {
 thread_local std::uint64_t tl_kmer_ns = 0;
 thread_local std::uint64_t tl_kmers = 0;
 
+// Distinct k-mer ids for region Jaccard: open addressing over the ids, each
+// stored with a mark in its two top bits (always clear in an id) saying which
+// side(s) it was seen on, so one 8-byte word per slot. A stored key always
+// has a mark bit set, so 0 marks a free slot. Reused per thread, clearing
+// only the slots last used.
+class KmerTagSet {
+ public:
+  void Reset(std::size_t n) {
+    std::size_t capacity = 1024;
+    while (capacity < 2 * n) {
+      capacity <<= 1;
+    }
+    if (capacity > keys_.size()) {
+      keys_.assign(capacity, 0);
+    } else {
+      for (const auto slot : used_) {
+        keys_[slot] = 0;
+      }
+    }
+    used_.clear();
+    mask_ = keys_.size() - 1;
+  }
+
+  // Mark `id` as seen on `side` (1 or 2); returns its marks before this.
+  std::uint8_t Mark(std::uint64_t id, std::uint8_t side) {
+    std::size_t i = (id ^ (id >> 32)) & mask_;
+    while (keys_[i] != 0 && (keys_[i] & kIdBits) != id) {
+      i = (i + 1) & mask_;
+    }
+    if (keys_[i] == 0) {
+      keys_[i] = id | static_cast<std::uint64_t>(side) << 62;
+      used_.push_back(i);
+      return 0;
+    }
+    const std::uint8_t marks = static_cast<std::uint8_t>(keys_[i] >> 62);
+    keys_[i] |= static_cast<std::uint64_t>(side) << 62;
+    return marks;
+  }
+
+ private:
+  static constexpr std::uint64_t kIdBits = ~(3ULL << 62);
+  std::vector<std::uint64_t> keys_;
+  std::vector<std::size_t> used_;
+  std::size_t mask_ = 0;
+};
+
 }  // namespace
 
 void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
@@ -2095,6 +2141,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     return static_cast<float>(intersection) / static_cast<float>(union_count);
   };
 
+
   // Gather the k-mer ids of the given regions of a pile into one sorted, deduped
   // vector (replaces per-region std::set construction + merging).
   // CPU time of the mapping phases summed over threads (ns), and counts,
@@ -2140,6 +2187,63 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     kmers.erase(std::unique(kmers.begin(), kmers.end()), kmers.end());
     tl_kmer_ns += ClockNs() - collect_start;
     return kmers;
+  };
+
+  // Jaccard of the distinct k-mers at lhs_positions of the query read
+  // (query_ids: its k-mer id at every position) and at rhs_positions of read
+  // rhs_id. The same value as calc_jaccard over collect_sorted_kmers, counted
+  // through a hash set instead of sorting, without re-hashing the query.
+  auto region_jaccard = [&](
+      const std::vector<std::uint64_t>& query_ids,
+      std::uint32_t query_id,
+      const std::vector<std::pair<std::uint32_t, std::uint32_t>>& lhs_positions,
+      std::uint32_t rhs_id,
+      const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rhs_positions) -> float {
+    if (param.store_kmer_ids) {
+      return calc_jaccard(collect_sorted_kmers(query_id, lhs_positions),
+                          collect_sorted_kmers(rhs_id, rhs_positions));
+    }
+    const std::uint64_t start = ClockNs();
+    thread_local KmerTagSet set;
+    thread_local std::vector<std::uint64_t> rhs_ids;
+    rhs_ids.clear();
+    for (const auto& p : rhs_positions) {
+      minimizer_engine.KmerIdsInRegion(*sequences[rhs_id], p.first, p.second, rhs_ids);
+    }
+    std::size_t num_lhs = 0;
+    for (const auto& p : lhs_positions) {
+      if (p.first <= p.second && p.first < query_ids.size()) {
+        num_lhs += std::min<std::size_t>(p.second, query_ids.size() - 1) - p.first + 1;
+      }
+    }
+    set.Reset(num_lhs + rhs_ids.size());
+    std::uint64_t distinct_lhs = 0;
+    std::uint64_t distinct_rhs = 0;
+    std::uint64_t shared = 0;
+    for (const auto& p : lhs_positions) {
+      if (p.first > p.second || p.first >= query_ids.size()) {
+        continue;
+      }
+      const std::size_t last = std::min<std::size_t>(p.second, query_ids.size() - 1);
+      for (std::size_t q = p.first; q <= last; ++q) {
+        if (set.Mark(query_ids[q], 1) == 0) {
+          ++distinct_lhs;
+        }
+      }
+    }
+    for (const auto id : rhs_ids) {
+      const std::uint8_t marks = set.Mark(id, 2);
+      if (!(marks & 2)) {
+        ++distinct_rhs;
+        shared += marks & 1;
+      }
+    }
+    tl_kmers += num_lhs + rhs_ids.size();
+    tl_kmer_ns += ClockNs() - start;
+    const std::uint64_t union_count = distinct_lhs + distinct_rhs - shared;
+    const float jaccard = union_count == 0 ?
+        0.0f : static_cast<float>(shared) / static_cast<float>(union_count);
+    return jaccard;
   };
 
   auto find_similarity_for_region =
@@ -2210,6 +2314,19 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
   //auto map_sequences = [&](std::uint32_t i) -> std::vector<std::vector<float>> { // map sequences
     PhaseTimes phase{phase_ns, phase_overlaps, phase_kmers};
     std::uint64_t phase_start = ClockNs();
+    // the query's k-mer id at every position, for all its overlaps' Jaccard
+    std::vector<std::uint64_t> query_ids;
+    bool query_ids_ready = false;
+    auto ids_of_query = [&]() -> const std::vector<std::uint64_t>& {
+      if (!query_ids_ready) {
+        if (!param.store_kmer_ids && sequences[i]->inflated_len >= param.kmer_len) {
+          minimizer_engine.KmerIdsInRegion(
+              *sequences[i], 0, sequences[i]->inflated_len - param.kmer_len, query_ids);
+        }
+        query_ids_ready = true;
+      }
+      return query_ids;
+    };
     std::vector<biosoup::Overlap> ovlps;
     std::vector<ram::MinimizerEngine::Anchors> ovlp_anchors;
     auto *anchors_out = keep_anchors ? &ovlp_anchors : nullptr;
@@ -2341,9 +2458,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         
         if(!lhs_hap_positions.empty() && !rhs_hap_positions.empty()){
           total_ovlp.hap_regions = true;
-          std::vector<std::uint64_t> lhs_hap_kmers = collect_sorted_kmers(ovlp.lhs_id, lhs_hap_positions);
-          std::vector<std::uint64_t> rhs_hap_kmers = collect_sorted_kmers(ovlp.rhs_id, rhs_hap_positions);
-          total_ovlp.jaccard_index = calc_jaccard(lhs_hap_kmers, rhs_hap_kmers);
+          total_ovlp.jaccard_index = region_jaccard(ids_of_query(), ovlp.lhs_id, lhs_hap_positions,
+                                                    ovlp.rhs_id, rhs_hap_positions);
         };
         total_ovlp.lhs_hap = graph_.piles_[total_ovlp.overlap.lhs_id]->return_haploid(
           ovlp.lhs_begin > param.kmer_len ? ovlp.lhs_begin - param.kmer_len : 0,
@@ -2379,9 +2495,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
             float dip_jaccard = 0.0f;
             if (!lhs_dip_positions.empty() && !rhs_dip_positions.empty()) {
-                std::vector<std::uint64_t> lhs_dip_kmers = collect_sorted_kmers(ovlp.lhs_id, lhs_dip_positions);
-                std::vector<std::uint64_t> rhs_dip_kmers = collect_sorted_kmers(ovlp.rhs_id, rhs_dip_positions);
-                dip_jaccard = calc_jaccard(lhs_dip_kmers, rhs_dip_kmers);
+                dip_jaccard = region_jaccard(ids_of_query(), ovlp.lhs_id, lhs_dip_positions,
+                                             ovlp.rhs_id, rhs_dip_positions);
             }
             if(both_hor){
               total_ovlp.diploid_jaccard_full_overlap = dip_jaccard;
@@ -2605,6 +2720,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
             << " k-mers), storing " << phase_ns[kMapStore] * s_per_ns
             << " (main thread); " << phase_overlaps << " overlaps"
             << std::endl;
+
 
   // ---- release the stored minimizers ----
   if (store_minimizers) {
