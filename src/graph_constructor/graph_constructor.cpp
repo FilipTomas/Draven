@@ -2606,6 +2606,15 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
   if (store_minimizers) {
     minimizer_engine.InitReadStore(sequences.size());
   }
+  // Correcting with the internal counter: sketching keeps each position's
+  // count class, which is all minimizer selection needs from the counts, so
+  // the counter (the largest table) is released after sketching and later
+  // minimizing does no count lookups.
+  const bool keep_count_classes =
+      param.correction_overlaps && use_fused_fastk && param.internal_count;
+  if (keep_count_classes) {
+    minimizer_engine.KeepCountClasses(sequences.size());
+  }
   if (two_pass) {
     // bloom sized at ~4x the minimizer instances (~14 bits per distinct one)
     const std::uint64_t instances = 2 * total_bases / (param.window_len + 1);
@@ -2639,6 +2648,13 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     for (auto &it : sequences) {
       std::vector<std::uint8_t>().swap(it->quality);
     }
+  }
+  if (keep_count_classes) {
+    minimizer_engine.set_internal_counter(nullptr);
+    internal_counter_.reset();
+    internal_counter.reset();
+    std::cerr << "[raven::Graph::Construct] released the k-mer counter "
+                 "(count classes kept per position)" << std::endl;
   }
 
   // ---- build the minimizer index ----
@@ -2726,6 +2742,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
   if (store_minimizers) {
     minimizer_engine.ClearReadStore();
   }
+  minimizer_engine.ClearCountClasses();
 }
 
 /*void Graph_Constructor::MapSequences(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
