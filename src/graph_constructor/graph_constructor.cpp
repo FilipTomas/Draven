@@ -1954,23 +1954,23 @@ class KmerTagSet {
     while (capacity < 2 * n) {
       capacity <<= 1;
     }
-    if (capacity > keys_.size()) {
-      keys_.assign(capacity, 0);
-    } else {
-      for (const auto slot : used_) {
-        keys_[slot] = 0;
-      }
+    for (const auto slot : used_) {
+      keys_[slot] = 0;
     }
     used_.clear();
-    mask_ = keys_.size() - 1;
+    if (capacity > keys_.size()) {
+      keys_.assign(capacity, 0);
+    }
+    mask_ = capacity - 1;  // slots past it stay free
   }
 
   // Mark `id` as seen on `side` (1 or 2); returns its marks before this.
+  // Grows past half full, so Reset's n is only a hint.
   std::uint8_t Mark(std::uint64_t id, std::uint8_t side) {
-    std::size_t i = (id ^ (id >> 32)) & mask_;
-    while (keys_[i] != 0 && (keys_[i] & kIdBits) != id) {
-      i = (i + 1) & mask_;
+    if (2 * (used_.size() + 1) > mask_ + 1) {
+      Grow();
     }
+    const std::size_t i = Probe(id);
     if (keys_[i] == 0) {
       keys_[i] = id | static_cast<std::uint64_t>(side) << 62;
       used_.push_back(i);
@@ -1982,11 +1982,187 @@ class KmerTagSet {
   }
 
  private:
+  std::size_t Probe(std::uint64_t id) const {
+    std::size_t i = (id ^ (id >> 32)) & mask_;
+    while (keys_[i] != 0 && (keys_[i] & kIdBits) != id) {
+      i = (i + 1) & mask_;
+    }
+    return i;
+  }
+
+  void Grow() {
+    std::vector<std::uint64_t> entries;
+    entries.reserve(used_.size());
+    for (const auto slot : used_) {
+      entries.push_back(keys_[slot]);
+      keys_[slot] = 0;
+    }
+    used_.clear();
+    const std::size_t capacity = 2 * (mask_ + 1);
+    if (capacity > keys_.size()) {
+      keys_.resize(capacity, 0);
+    }
+    mask_ = capacity - 1;
+    for (const auto entry : entries) {
+      const std::size_t i = Probe(entry & kIdBits);
+      keys_[i] = entry;
+      used_.push_back(i);
+    }
+  }
+
   static constexpr std::uint64_t kIdBits = ~(3ULL << 62);
   std::vector<std::uint64_t> keys_;
   std::vector<std::size_t> used_;
   std::size_t mask_ = 0;
 };
+
+// The positions of every k-mer id of one read: open addressing from id to its
+// first position (8 B slots: 32 bits of the id, checked against the read's ids
+// on a match, and the position), the positions of an id chained in order
+// through next, and each position's first one. Stamps, one per id at its first
+// position, let a caller mark ids as seen in one pass (NewPass) without a set.
+// Ids never equal ~0 (their top bits are cleared). Reused per thread.
+class KmerPositions {
+ public:
+  static constexpr std::uint32_t kNone = ~0U;
+
+  // ids: the read's k-mer id at every position; kept by pointer until the
+  // next Build
+  void Build(const std::vector<std::uint64_t>& ids) {
+    ids_ = ids.data();
+    std::size_t capacity = 1024;
+    while (capacity < 2 * ids.size()) {
+      capacity <<= 1;
+    }
+    // reuse the buffers, but do not keep those of a much longer read
+    if (slots_.size() > (1U << 22) && slots_.size() > 4 * capacity) {
+      std::vector<Slot>().swap(slots_);
+      std::vector<std::uint32_t>().swap(next_);
+      std::vector<std::uint32_t>().swap(first_of_);
+      std::vector<std::uint32_t>().swap(stamps_);
+    }
+    slots_.assign(capacity, Slot{0, kNone});
+    mask_ = capacity - 1;
+    next_.resize(ids.size());
+    for (std::uint32_t p = ids.size(); p-- > 0;) {
+      Slot& slot = slots_[Probe(ids[p])];
+      if (slot.first == kNone) {
+        slot.fingerprint = Fingerprint(ids[p]);
+        next_[p] = kNone;
+      } else {
+        next_[p] = slot.first;
+      }
+      slot.first = p;
+    }
+    // each chain from its head on (a chain's positions increase)
+    first_of_.assign(ids.size(), kNone);
+    for (std::uint32_t p = 0; p < ids.size(); ++p) {
+      if (first_of_[p] == kNone) {
+        first_of_[p] = p;
+      }
+      if (next_[p] != kNone) {
+        first_of_[next_[p]] = first_of_[p];
+      }
+    }
+    stamps_.assign(ids.size(), 0);
+    pass_ = 0;
+  }
+
+  // the first position of `id`, or kNone; Next() walks the others
+  std::uint32_t First(std::uint64_t id) const {
+    return slots_[Probe(id)].first;
+  }
+  std::uint32_t Next(std::uint32_t pos) const { return next_[pos]; }
+  // the first position of the k-mer at `pos`
+  std::uint32_t FirstOf(std::uint32_t pos) const { return first_of_[pos]; }
+
+  // Start a pass; Stamp(first) then says whether the id whose first position
+  // is `first` was already stamped in it, and Stamped(first) only asks.
+  void NewPass() { ++pass_; }
+  bool Stamp(std::uint32_t first) {
+    if (stamps_[first] == pass_) {
+      return true;
+    }
+    stamps_[first] = pass_;
+    return false;
+  }
+  bool Stamped(std::uint32_t first) const { return stamps_[first] == pass_; }
+
+  // f(pos) for every position whose k-mer occurs nowhere else in the read
+  template <typename F>
+  void ForEachUnique(F f) const {
+    for (const auto& slot : slots_) {
+      if (slot.first != kNone && next_[slot.first] == kNone) {
+        f(slot.first);
+      }
+    }
+  }
+
+ private:
+  struct Slot {
+    std::uint32_t fingerprint;
+    std::uint32_t first;  // kNone: free
+  };
+  static std::uint32_t Fingerprint(std::uint64_t id) {
+    return static_cast<std::uint32_t>(id >> 30);
+  }
+  // the slot of `id`, or the free slot where it would go
+  std::size_t Probe(std::uint64_t id) const {
+    const std::uint32_t fingerprint = Fingerprint(id);
+    std::size_t i = (id ^ (id >> 32)) & mask_;
+    while (slots_[i].first != kNone &&
+           (slots_[i].fingerprint != fingerprint || ids_[slots_[i].first] != id)) {
+      i = (i + 1) & mask_;
+    }
+    return i;
+  }
+  const std::uint64_t* ids_ = nullptr;
+  std::vector<Slot> slots_;
+  std::vector<std::uint32_t> next_;
+  std::vector<std::uint32_t> first_of_;
+  std::vector<std::uint32_t> stamps_;
+  std::size_t mask_ = 0;
+  std::uint32_t pass_ = 0;
+};
+
+// A bit filter over a set of ids, sized per use: 16+ bits per id, two bits of
+// one word each, so ~2% of absent ids pass. Reused per thread.
+class IdFilter {
+ public:
+  void Reset(std::size_t n) {
+    std::size_t words = 16;
+    shift_ = 60;
+    while (words * 64 < 16 * n) {
+      words <<= 1;
+      --shift_;
+    }
+    words_.assign(words, 0);
+  }
+  void Add(std::uint64_t id) {
+    const std::uint64_t h = Hash(id);
+    words_[h >> shift_] |= Bits(h);
+  }
+  bool MayContain(std::uint64_t id) const {
+    const std::uint64_t h = Hash(id);
+    const std::uint64_t bits = Bits(h);
+    return (words_[h >> shift_] & bits) == bits;
+  }
+
+ private:
+  // mixed, since tables use the id's low bits (and its top 2 are 0)
+  static std::uint64_t Hash(std::uint64_t id) { return id * 0x9e3779b97f4a7c15ULL; }
+  static std::uint64_t Bits(std::uint64_t h) {
+    return 1ULL << (h & 63) | 1ULL << (h >> 6 & 63);
+  }
+  std::vector<std::uint64_t> words_;
+  std::uint32_t shift_ = 60;
+};
+
+// One per thread, for the bits pass before mapping and then for each query.
+KmerPositions& ThreadKmerPositions() {
+  thread_local KmerPositions positions;
+  return positions;
+}
 
 }  // namespace
 
@@ -2232,56 +2408,134 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     return kmers;
   };
 
-  // Jaccard of the distinct k-mers at lhs_positions of the query read
-  // (query_ids: its k-mer id at every position) and at rhs_positions of read
-  // rhs_id. The same value as calc_jaccard over collect_sorted_kmers, counted
-  // through a hash set instead of sorting, without re-hashing the query.
+  // Per read, a bit per k-mer position: set if the k-mer occurs nowhere else
+  // in the read (filled before mapping, see below). A unique k-mer is
+  // distinct in any region of its read without a set lookup.
+  std::vector<std::vector<std::uint64_t>> unique_kmer_bits;
+
+  // Jaccard of the distinct k-mers at lhs_positions of the query read and at
+  // rhs_positions of read rhs_id: the same value as calc_jaccard over
+  // collect_sorted_kmers, without a set of every k-mer per overlap. The
+  // query's region is counted with its unique bits and stamps on its repeated
+  // k-mers, and put in a small filter. Of the other read's distinct k-mers
+  // (a set only for its repeated ones), those that pass the filter are looked
+  // up in the query's positions (query_positions, built once per query from
+  // query_ids).
   auto region_jaccard = [&](
       const std::vector<std::uint64_t>& query_ids,
+      KmerPositions& query_positions,
       std::uint32_t query_id,
       const std::vector<std::pair<std::uint32_t, std::uint32_t>>& lhs_positions,
       std::uint32_t rhs_id,
-      const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rhs_positions) -> float {
+      const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rhs_positions,
+      bool same_strand) -> float {
     if (param.store_kmer_ids) {
       return calc_jaccard(collect_sorted_kmers(query_id, lhs_positions),
                           collect_sorted_kmers(rhs_id, rhs_positions));
     }
     const std::uint64_t start = ClockNs();
-    thread_local KmerTagSet set;
+    thread_local KmerTagSet rhs_repeated;            // repeated ids of the other read seen
+    thread_local IdFilter in_lhs_filter;             // the query region's ids
+    thread_local std::vector<std::uint64_t> in_lhs;  // bitmap of the query region
     thread_local std::vector<std::uint64_t> rhs_ids;
-    rhs_ids.clear();
-    for (const auto& p : rhs_positions) {
-      minimizer_engine.KmerIdsInRegion(*sequences[rhs_id], p.first, p.second, rhs_ids);
-    }
-    std::size_t num_lhs = 0;
+    std::uint64_t num_kmers = 0;
+
+    // the query region's positions, their distinct k-mers
+    const std::size_t num_ids = query_ids.size();
+    std::size_t span_first = num_ids;
+    std::size_t span_last = 0;
     for (const auto& p : lhs_positions) {
-      if (p.first <= p.second && p.first < query_ids.size()) {
-        num_lhs += std::min<std::size_t>(p.second, query_ids.size() - 1) - p.first + 1;
+      if (p.first <= p.second && p.first < num_ids) {
+        span_first = std::min<std::size_t>(span_first, p.first);
+        span_last = std::max<std::size_t>(span_last, std::min<std::size_t>(p.second, num_ids - 1));
       }
     }
-    set.Reset(num_lhs + rhs_ids.size());
+    const auto& lhs_unique = unique_kmer_bits[query_id];
     std::uint64_t distinct_lhs = 0;
+    query_positions.NewPass();
+    if (span_first <= span_last) {
+      in_lhs.assign((span_last - span_first) / 64 + 1, 0);
+      in_lhs_filter.Reset(span_last - span_first + 1);
+      for (const auto& p : lhs_positions) {
+        if (p.first > p.second || p.first >= num_ids) {
+          continue;
+        }
+        const std::size_t last = std::min<std::size_t>(p.second, num_ids - 1);
+        for (std::size_t q = p.first; q <= last; ++q) {
+          const std::size_t bit = q - span_first;
+          if (in_lhs[bit >> 6] >> (bit & 63) & 1) {
+            continue;  // position listed twice
+          }
+          in_lhs[bit >> 6] |= 1ULL << (bit & 63);
+          ++num_kmers;
+          in_lhs_filter.Add(query_ids[q]);
+          if ((lhs_unique[q >> 6] >> (q & 63) & 1) ||
+              !query_positions.Stamp(query_positions.FirstOf(q))) {
+            ++distinct_lhs;
+          }
+        }
+      }
+    } else {
+      in_lhs_filter.Reset(0);
+    }
+    auto in_lhs_region = [&](std::uint32_t q) -> bool {
+      if (q < span_first || q > span_last) return false;
+      const std::size_t bit = q - span_first;
+      return in_lhs[bit >> 6] >> (bit & 63) & 1;
+    };
+
+    // the other read's region: its distinct k-mers and those in the query's
+    const auto& rhs_unique = unique_kmer_bits[rhs_id];
+    rhs_repeated.Reset(0);
     std::uint64_t distinct_rhs = 0;
     std::uint64_t shared = 0;
-    for (const auto& p : lhs_positions) {
-      if (p.first > p.second || p.first >= query_ids.size()) {
-        continue;
-      }
-      const std::size_t last = std::min<std::size_t>(p.second, query_ids.size() - 1);
-      for (std::size_t q = p.first; q <= last; ++q) {
-        if (set.Mark(query_ids[q], 1) == 0) {
-          ++distinct_lhs;
+    // Along the overlap's diagonal, a shared k-mer is mostly where the last
+    // one predicts (its query position plus the step, mirrored on the other
+    // strand), which spares the lookup; a miss falls back to it.
+    const std::int64_t step = same_strand ? 1 : -1;
+    std::int64_t last_q = -1;  // query position of the last shared k-mer
+    std::int64_t last_pos = 0;
+    for (const auto& p : rhs_positions) {
+      rhs_ids.clear();
+      minimizer_engine.KmerIdsInRegion(*sequences[rhs_id], p.first, p.second, rhs_ids);
+      num_kmers += rhs_ids.size();
+      for (std::size_t k = 0; k < rhs_ids.size(); ++k) {
+        const std::uint32_t pos = p.first + k;
+        const std::uint64_t id = rhs_ids[k];
+        if (!(rhs_unique[pos >> 6] >> (pos & 63) & 1) && rhs_repeated.Mark(id, 2)) {
+          continue;  // already counted
+        }
+        ++distinct_rhs;
+        if (!in_lhs_filter.MayContain(id)) {
+          continue;
+        }
+        if (last_q >= 0) {
+          const std::int64_t q = last_q + step * (static_cast<std::int64_t>(pos) - last_pos);
+          if (q >= 0 && q < static_cast<std::int64_t>(num_ids) && query_ids[q] == id &&
+              in_lhs_region(static_cast<std::uint32_t>(q))) {
+            ++shared;
+            last_q = q;
+            last_pos = pos;
+            continue;
+          }
+        }
+        const std::uint32_t q = query_positions.First(id);
+        if (q == KmerPositions::kNone) {
+          continue;
+        }
+        if (query_positions.Next(q) == KmerPositions::kNone) {  // the query's only copy
+          if (in_lhs_region(q)) {
+            ++shared;
+            last_q = q;
+            last_pos = pos;
+          }
+        } else if (query_positions.Stamped(q)) {
+          // repeated in the query: stamped above iff a copy is in the region
+          ++shared;
         }
       }
     }
-    for (const auto id : rhs_ids) {
-      const std::uint8_t marks = set.Mark(id, 2);
-      if (!(marks & 2)) {
-        ++distinct_rhs;
-        shared += marks & 1;
-      }
-    }
-    tl_kmers += num_lhs + rhs_ids.size();
+    tl_kmers += num_kmers;
     tl_kmer_ns += ClockNs() - start;
     const std::uint64_t union_count = distinct_lhs + distinct_rhs - shared;
     const float jaccard = union_count == 0 ?
@@ -2359,6 +2613,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     std::uint64_t phase_start = ClockNs();
     // the query's k-mer id at every position, for all its overlaps' Jaccard
     std::vector<std::uint64_t> query_ids;
+    KmerPositions& query_positions = ThreadKmerPositions();
     bool query_ids_ready = false;
     auto ids_of_query = [&]() -> const std::vector<std::uint64_t>& {
       if (!query_ids_ready) {
@@ -2366,6 +2621,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
           minimizer_engine.KmerIdsInRegion(
               *sequences[i], 0, sequences[i]->inflated_len - param.kmer_len, query_ids);
         }
+        query_positions.Build(query_ids);
         query_ids_ready = true;
       }
       return query_ids;
@@ -2501,8 +2757,9 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
         
         if(!lhs_hap_positions.empty() && !rhs_hap_positions.empty()){
           total_ovlp.hap_regions = true;
-          total_ovlp.jaccard_index = region_jaccard(ids_of_query(), ovlp.lhs_id, lhs_hap_positions,
-                                                    ovlp.rhs_id, rhs_hap_positions);
+          total_ovlp.jaccard_index = region_jaccard(ids_of_query(), query_positions, ovlp.lhs_id,
+                                                    lhs_hap_positions, ovlp.rhs_id, rhs_hap_positions,
+                                                    ovlp.strand);
         };
         total_ovlp.lhs_hap = graph_.piles_[total_ovlp.overlap.lhs_id]->return_haploid(
           ovlp.lhs_begin > param.kmer_len ? ovlp.lhs_begin - param.kmer_len : 0,
@@ -2538,8 +2795,9 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
             float dip_jaccard = 0.0f;
             if (!lhs_dip_positions.empty() && !rhs_dip_positions.empty()) {
-                dip_jaccard = region_jaccard(ids_of_query(), ovlp.lhs_id, lhs_dip_positions,
-                                             ovlp.rhs_id, rhs_dip_positions);
+                dip_jaccard = region_jaccard(ids_of_query(), query_positions, ovlp.lhs_id,
+                                             lhs_dip_positions, ovlp.rhs_id, rhs_dip_positions,
+                                             ovlp.strand);
             }
             if(both_hor){
               total_ovlp.diploid_jaccard_full_overlap = dip_jaccard;
@@ -2723,6 +2981,36 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
             << std::fixed << timer.Stop() << "s"
             << std::endl;
 
+  // ---- unique k-mer bits of every read, for the overlaps' Jaccard ----
+  if (!param.store_kmer_ids) {
+    timer.Start();
+    unique_kmer_bits.resize(sequences.size());
+    std::vector<std::future<void>> futures;
+    futures.reserve(sequences.size());
+    for (std::uint32_t k = 0; k < sequences.size(); ++k) {
+      futures.emplace_back(thread_pool_->Submit([&](std::uint32_t r) -> void {
+        thread_local std::vector<std::uint64_t> ids;
+        KmerPositions& positions = ThreadKmerPositions();
+        ids.clear();
+        if (sequences[r]->inflated_len >= param.kmer_len) {
+          minimizer_engine.KmerIdsInRegion(
+              *sequences[r], 0, sequences[r]->inflated_len - param.kmer_len, ids);
+        }
+        positions.Build(ids);
+        auto &bits = unique_kmer_bits[r];
+        bits.assign(ids.size() / 64 + 1, 0);
+        positions.ForEachUnique([&](std::uint32_t p) -> void {
+          bits[p >> 6] |= 1ULL << (p & 63);
+        });
+      }, k));
+    }
+    for (const auto &it : futures) {
+      it.wait();
+    }
+    std::cerr << "[raven::Graph::Construct] unique k-mer bits of every read "
+              << std::fixed << timer.Stop() << "s" << std::endl;
+  }
+
   // ---- map every read against it ----
   {
     std::vector<std::future<std::vector<extended_overlap>>> thread_futures;
@@ -2779,6 +3067,7 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
             << " k-mers), storing " << phase_ns[kMapStore] * s_per_ns
             << " (main thread); " << phase_overlaps << " overlaps"
             << std::endl;
+  std::vector<std::vector<std::uint64_t>>().swap(unique_kmer_bits);
 
 
   // ---- release the stored minimizers ----
