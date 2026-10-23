@@ -2,6 +2,7 @@
 #define RAVEN_CORRECTION_CANDIDATE_H
 
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -12,8 +13,9 @@
 // dump read, without the rest of extended_overlap (152 B instead of 376 B).
 // lhs is the read of the pile it is stored in. Coordinates are those of the
 // extended overlap; graph_overlap_type is set by containment for strong
-// overlaps and is 0 for the others.
-struct correction_candidate {
+// overlaps and is 0 for the others. The fields are plain data
+// (correction_candidate_fields), so they can be written out as bytes.
+struct correction_candidate_fields {
   std::uint32_t lhs_id = 0;
   std::uint32_t lhs_begin = 0;
   std::uint32_t lhs_end = 0;
@@ -48,6 +50,11 @@ struct correction_candidate {
   bool strand = true;
   bool q_hor = false;
   bool t_hor = false;
+};
+static_assert(std::is_trivially_copyable<correction_candidate_fields>::value,
+              "correction_candidate_fields is written out as bytes");
+
+struct correction_candidate : correction_candidate_fields {
   // chain anchors (lhs, rhs), see extended_overlap::anchors
   std::vector<std::pair<std::uint32_t, std::uint32_t>> anchors;
 };

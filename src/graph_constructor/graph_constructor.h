@@ -11,7 +11,12 @@
 #include "biosoup/timer.hpp"
 #include "ram/kmer_counter.hpp"
 #include "correction_candidate.h"
+#include "candidate_spill.h"
 #include <numeric>
+
+namespace overlap_selection {
+class RandomForest;
+}  // namespace overlap_selection
 
 namespace raven {
 
@@ -99,14 +104,34 @@ private:
   // is aligned (e.g. to write it out and free it).
   void LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps,
                             const std::function<void(std::uint32_t)> &pile_aligned = nullptr);
+  // Aligns the piles [first, last) (all by default).
   void AlignCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                std::vector<std::vector<extended_overlap>> &extended_overlaps,
                                std::uint32_t kmer_len,
                                double max_edit_rate,
-                               const std::function<void(std::uint32_t)> &pile_aligned = nullptr);
+                               const std::function<void(std::uint32_t)> &pile_aligned = nullptr,
+                               std::uint32_t first = 0,
+                               std::uint32_t last = static_cast<std::uint32_t>(-1));
+  // Reads group `group` of the spilled candidates into correction_candidates_
+  // (only the piles of reads that will be corrected).
+  void LoadCandidateGroup(std::uint32_t group);
+  // Totals of SelectCorrectionOverlaps over the groups of piles it runs on.
+  struct SelectionStats {
+    std::uint64_t candidates = 0;
+    std::uint64_t kept = 0;
+    std::uint64_t skipped = 0;  // invalid coordinates
+    // kept overlaps whose support read is strongly contained: in the
+    // target, or overlapping it otherwise (dovetail, or containing it)
+    std::uint64_t kept_contained_support = 0;
+    std::uint64_t kept_dovetail_contained_support = 0;
+  };
+  // Selects among the candidates of the piles [first, last) and frees them.
   void SelectCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                                 std::vector<std::vector<extended_overlap>> &extended_overlaps,
-                                Program_Parameters &param);
+                                Program_Parameters &param,
+                                const overlap_selection::RandomForest &forest,
+                                std::uint32_t first, std::uint32_t last,
+                                SelectionStats &stats);
   void MapSequences(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
                     std::vector<std::vector<extended_overlap>> &extended_overlaps,
                     biosoup::Timer &timer,
@@ -185,6 +210,9 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
   std::uint32_t containment_threshold_ = 3;
   // Correction path: candidate overlaps per read, from mapping to selection
   std::vector<std::vector<correction_candidate>> correction_candidates_;
+  // With --spill-dir, mapping writes the candidates here instead, and
+  // selection reads them back one group of piles at a time.
+  std::unique_ptr<CandidateSpill> candidate_spill_;
 
   double disagreement_;
 };

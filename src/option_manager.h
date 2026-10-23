@@ -62,6 +62,10 @@ struct Program_Parameters {
   // above this many bases of reads the minimizer index is built in two
   // passes instead of keeping every read's minimizers (default 2^32)
   std::uint64_t two_pass_index_bases = 1ULL << 32;
+  // if set, correction candidates are written to files in this directory
+  // during mapping and selected and aligned one group of reads at a time
+  std::string spill_dir = "";
+  std::uint32_t spill_groups = 16;
   // path to the precomputed FastK counts (used when --internal-count is off)
   std::string fastk_path = "/mnt/share1_Jabba/ftomas/fastk_counts/badread_ONT_k21/chr19";
 

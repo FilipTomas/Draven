@@ -4,6 +4,8 @@
 #include <filesystem>
 #include "option_manager.h"
 
+#include <algorithm>
+
 enum program_opt {
   opt_error_corrected_reads,
   opt_herro_snps,
@@ -49,6 +51,8 @@ enum program_opt {
   opt_anchor_spacing,
   opt_max_edit_rate,
   opt_two_pass_index_above,
+  opt_spill_dir,
+  opt_spill_groups,
   opt_fastk_counts,
   opt_threads,
 
@@ -109,6 +113,8 @@ static struct option options[] = {
     {"anchor-spacing", required_argument, nullptr, opt_anchor_spacing},
     {"max-edit-rate", required_argument, nullptr, opt_max_edit_rate},
     {"two-pass-index-above", required_argument, nullptr, opt_two_pass_index_above},
+    {"spill-dir", required_argument, nullptr, opt_spill_dir},
+    {"spill-groups", required_argument, nullptr, opt_spill_groups},
     {"fastk-counts", required_argument, nullptr, opt_fastk_counts},
     {"threads", required_argument, nullptr, opt_threads},
 
@@ -273,6 +279,15 @@ void Help() {
             "      sketching and fill the index in a second pass instead of keeping\n"
             "      every read's minimizers (less memory, ~2 extra minimizing passes);\n"
             "      0 always does\n"
+            "    --spill-dir <string>\n"
+            "      default: none (candidates stay in memory)\n"
+            "      write correction candidates to files in this existing directory\n"
+            "      during mapping, then select and align them one group of reads at\n"
+            "      a time; the files are deleted as they are read (needs about\n"
+            "      250 B per candidate of disk)\n"
+            "    --spill-groups <int>\n"
+            "      default: 16\n"
+            "      groups of reads for --spill-dir; more groups hold less in memory\n"
             "    --fastk-counts <string>\n"
             "      path to the precomputed FastK counts (used when --internal-count\n"
             "      is off); build FastK on the same reads for an apples-to-apples\n"
@@ -482,6 +497,12 @@ int ProcessParameters(int argc, char **argv, Program_Parameters& param) {
         param.two_pass_index_bases =
             static_cast<std::uint64_t>(std::atof(optarg) * 1e9);
         break;
+      case opt_spill_dir:
+        param.spill_dir = optarg;
+        break;
+      case opt_spill_groups:
+        param.spill_groups = std::max(1, std::atoi(optarg));
+        break;
       case opt_fastk_counts:
         param.fastk_path = optarg;
         break;
@@ -533,6 +554,13 @@ int ProcessParameters(int argc, char **argv, Program_Parameters& param) {
 
   if (optind >= argc && !param.skip_contruction) {
     std::cerr << "[raven::] error: missing input file!" << std::endl;
+    return 0;
+  }
+
+  // checked now rather than when mapping starts, hours in
+  if (!param.spill_dir.empty() && !std::filesystem::is_directory(param.spill_dir)) {
+    std::cerr << "[raven::] error: --spill-dir " << param.spill_dir
+              << " is not a directory!" << std::endl;
     return 0;
   }
 

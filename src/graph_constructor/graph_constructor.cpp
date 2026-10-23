@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <cassert>
+#include <future>
 #include <string>
 #ifdef __GLIBC__
 #include <malloc.h>
@@ -563,6 +564,20 @@ static void ReleaseFreedMemory(const char *stage) {
             << timer.Stop() << "s" << std::endl;
 }
 
+void Graph_Constructor::LoadCandidateGroup(std::uint32_t group) {
+  biosoup::Timer timer{};
+  timer.Start();
+  // only the piles of reads that will be corrected, as selection scores
+  const std::uint64_t bytes = candidate_spill_->Load(
+      group, correction_candidates_, [&](std::uint32_t i) -> bool {
+        return graph_.piles_[i]->is_backbone() && !graph_.piles_[i]->is_strong_contained();
+      });
+  std::cerr << std::fixed << std::setprecision(2) << "[raven::] candidate group "
+            << group + 1 << " / " << candidate_spill_->num_groups() << ": read "
+            << bytes / (1024.0 * 1024.0 * 1024.0) << " GB " << std::setprecision(3)
+            << timer.Stop() << "s" << std::endl;
+}
+
 void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, Program_Parameters &param){
     std::vector<std::vector<extended_overlap>> extended_overlaps(sequences.size());
     biosoup::Timer timer{};
@@ -587,6 +602,11 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
         std::cerr << "Printing pre-alignment backbone correction overlaps with features!"
                   << std::endl;
         // the dump prints only reads that will be corrected
+        if (candidate_spill_) {
+          for (std::uint32_t g = 0; g < candidate_spill_->num_groups(); ++g) {
+            LoadCandidateGroup(g);
+          }
+        }
         for (std::uint32_t i = 0; i < correction_candidates_.size(); ++i) {
           if (!graph_.piles_[i]->is_backbone() || graph_.piles_[i]->is_strong_contained()) {
             continue;
@@ -626,12 +646,79 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
     };
 
     if (compute_overlaps) {
-      LogOverlapMemory(correction_candidates_, "before selection");
-      SelectCorrectionOverlaps(sequences, extended_overlaps, param);
-      LogOverlapMemory(extended_overlaps, "after selection");
-      ReleaseFreedMemory("selection");
-      AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
-                          param.max_edit_rate, write_pile);
+      overlap_selection::RandomForest forest;
+      forest.Load(param.rf_model_path);
+      std::cerr << "[raven::SelectCorrectionOverlaps] loaded " << forest.num_trees()
+                << " trees from " << param.rf_model_path << std::endl;
+      const std::uint32_t num_groups =
+          candidate_spill_ ? candidate_spill_->num_groups() : 1;
+      biosoup::Timer selection_timer{};
+      double selection_s = 0;
+      SelectionStats stats;
+      // totals; with groups, printed before the last group aligns
+      auto print_selection = [&]() -> void {
+        if (param.dump_rf_scores) {
+          std::cerr << "[raven::SelectCorrectionOverlaps] wrote rf_selection.tsv"
+                    << std::endl;
+        }
+        std::cerr << "[raven::SelectCorrectionOverlaps] kept " << stats.kept << " / "
+                  << stats.candidates << " candidate overlaps ("
+                  << (stats.candidates ? 100.0 * stats.kept / stats.candidates : 0.0) << "%), "
+                  << "window " << param.rf_window_size << ", top " << param.rf_top_k
+                  << (param.rf_require_full_window ? ", full-window" : ", any-overlap")
+                  << ", skipped " << stats.skipped << " invalid, "
+                  << std::fixed << selection_s << "s"
+                  << (num_groups > 1 ? " (overlapped with aligning)" : "") << std::endl;
+        std::cerr << "[raven::SelectCorrectionOverlaps] kept overlaps with a strongly "
+                     "contained support read: " << stats.kept_contained_support
+                  << " contained in the target, " << stats.kept_dovetail_contained_support
+                  << " otherwise" << std::endl;
+      };
+      // Select and align one group of piles at a time (one group, all piles,
+      // unless the candidates were spilled to files). With more groups, the
+      // next one is read and selected, and its alignments queued, while the
+      // previous one aligns, so the pool does not idle on each group's last
+      // piles; at most two groups are in memory.
+      std::future<void> aligning;  // the previous group's alignment
+      for (std::uint32_t g = 0; g < num_groups; ++g) {
+        const std::uint32_t first = candidate_spill_ ? candidate_spill_->First(g) : 0;
+        const std::uint32_t last =
+            candidate_spill_ ? candidate_spill_->First(g + 1) : sequences.size();
+        if (candidate_spill_) {
+          LoadCandidateGroup(g);
+        }
+        if (g == 0) {
+          LogOverlapMemory(correction_candidates_, "before selection");
+        }
+        selection_timer.Start();
+        SelectCorrectionOverlaps(sequences, extended_overlaps, param, forest,
+                                 first, last, stats);
+        selection_s += selection_timer.Stop();
+        if (g == 0) {
+          LogOverlapMemory(extended_overlaps, "after selection");
+          ReleaseFreedMemory("selection");
+        }
+        if (g + 1 == num_groups) {
+          std::vector<std::vector<correction_candidate>>().swap(correction_candidates_);
+          print_selection();
+        }
+        auto align_group = [&, first, last]() -> void {
+          AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
+                                  param.max_edit_rate, write_pile, first, last);
+        };
+        if (num_groups == 1) {
+          align_group();
+          continue;
+        }
+        std::future<void> next = std::async(std::launch::async, align_group);
+        if (aligning.valid()) {
+          aligning.get();
+        }
+        aligning = std::move(next);
+      }
+      if (aligning.valid()) {
+        aligning.get();
+      }
       LogOverlapMemory(extended_overlaps, "after alignment");
     } else {
       LoadOverlapsAndAlign(param, sequences, extended_overlaps, write_pile);
@@ -649,21 +736,17 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
 }
 
 // In-process replacement for mm2_draven_match.ipynb: score every backbone
-// correction candidate (correction_candidates_) with the exported random
-// forest, keep the top-K per target window, and put the kept ones into
-// extended_overlaps in the state LoadOverlapsAndAlign would load them in
-// (plain coordinates, not aligned). The candidates are freed.
+// correction candidate (correction_candidates_) of the piles [first, last)
+// with the exported random forest, keep the top-K per target window, and put
+// the kept ones into extended_overlaps in the state LoadOverlapsAndAlign would
+// load them in (plain coordinates, not aligned). The candidates are freed.
 void Graph_Constructor::SelectCorrectionOverlaps(
     std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
     std::vector<std::vector<extended_overlap>> &extended_overlaps,
-    Program_Parameters &param) {
-  biosoup::Timer timer{};
-  timer.Start();
-
-  overlap_selection::RandomForest forest;
-  forest.Load(param.rf_model_path);
-  std::cerr << "[raven::SelectCorrectionOverlaps] loaded " << forest.num_trees()
-            << " trees from " << param.rf_model_path << std::endl;
+    Program_Parameters &param,
+    const overlap_selection::RandomForest &forest,
+    std::uint32_t first, std::uint32_t last,
+    SelectionStats &stats) {
 
   // Same reads PrintBackboneOverlapsWithFeatures dumps for the notebook.
   auto is_corrected = [&](std::uint32_t i) -> bool {
@@ -672,8 +755,10 @@ void Graph_Constructor::SelectCorrectionOverlaps(
   };
 
   auto &candidates = correction_candidates_;
-  std::vector<std::vector<double>> probabilities(candidates.size());
-  std::vector<std::vector<bool>> selected(candidates.size());
+  last = std::min<std::uint32_t>(last, candidates.size());
+  // per pile of the range, from index i - first
+  std::vector<std::vector<double>> probabilities(last > first ? last - first : 0);
+  std::vector<std::vector<bool>> selected(probabilities.size());
 
   auto score_pile = [&](std::uint32_t i) -> void {
     if (!is_corrected(i) || candidates[i].empty()) return;
@@ -694,20 +779,20 @@ void Graph_Constructor::SelectCorrectionOverlaps(
         pile, target_length, query_lengths);
     const std::size_t n_features = overlap_selection::FeatureNames().size();
 
-    auto &probs = probabilities[i];
+    auto &probs = probabilities[i - first];
     probs.resize(pile.size());
     for (std::size_t k = 0; k < pile.size(); ++k) {
       probs[k] = forest.PredictProba(&features[k * n_features]);
     }
 
-    selected[i] = overlap_selection::SelectWindowTopK(
+    selected[i - first] = overlap_selection::SelectWindowTopK(
         pile, probs, target_length, param.rf_window_size, param.rf_top_k,
         param.rf_require_full_window);
   };
 
   std::vector<std::future<void>> futures;
-  futures.reserve(candidates.size());
-  for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+  futures.reserve(probabilities.size());
+  for (std::uint32_t i = first; i < last; ++i) {
     futures.emplace_back(thread_pool_->Submit(score_pile, i));
   }
   for (const auto &it : futures) {
@@ -716,12 +801,15 @@ void Graph_Constructor::SelectCorrectionOverlaps(
 
   if (param.dump_rf_scores) {
     // PAF key columns (query = rhs, target = lhs) + probability, joinable
-    // with the notebook's selected_top30_per_window.tsv.
-    std::ofstream os("rf_selection.tsv");
+    // with the notebook's selected_top30_per_window.tsv. Later groups of
+    // piles append.
+    std::ofstream os("rf_selection.tsv", first == 0 ? std::ios::out : std::ios::app);
     os << std::setprecision(std::numeric_limits<double>::max_digits10);
-    os << "qn\tql\tqs\tqe\tstrand\ttn\ttl\tts\tte\tpred_proba\tselected\n";
-    for (std::uint32_t i = 0; i < candidates.size(); ++i) {
-      for (std::size_t k = 0; k < probabilities[i].size(); ++k) {
+    if (first == 0) {
+      os << "qn\tql\tqs\tqe\tstrand\ttn\ttl\tts\tte\tpred_proba\tselected\n";
+    }
+    for (std::uint32_t i = first; i < last; ++i) {
+      for (std::size_t k = 0; k < probabilities[i - first].size(); ++k) {
         const auto &o = candidates[i][k];
         os << sequences[o.rhs_id]->name << '\t'
            << sequences[o.rhs_id]->inflated_len << '\t'
@@ -730,37 +818,27 @@ void Graph_Constructor::SelectCorrectionOverlaps(
            << sequences[o.lhs_id]->name << '\t'
            << sequences[o.lhs_id]->inflated_len << '\t'
            << o.lhs_begin << '\t' << o.lhs_end << '\t'
-           << probabilities[i][k] << '\t'
-           << (selected[i][k] ? 1 : 0) << '\n';
+           << probabilities[i - first][k] << '\t'
+           << (selected[i - first][k] ? 1 : 0) << '\n';
       }
     }
-    std::cerr << "[raven::SelectCorrectionOverlaps] wrote rf_selection.tsv"
-              << std::endl;
   }
 
-  std::uint64_t num_candidates = 0;
-  std::uint64_t kept = 0;
-  std::uint64_t skipped = 0;
-  // kept overlaps whose support read is strongly contained: in the target,
-  // or overlapping it otherwise (dovetail, or containing it)
-  std::uint64_t kept_contained_support = 0;
-  std::uint64_t kept_dovetail_contained_support = 0;
-
-  for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+  for (std::uint32_t i = first; i < last; ++i) {
     std::vector<correction_candidate> pile;
     pile.swap(candidates[i]);
-    if (selected[i].empty()) continue;
+    if (selected[i - first].empty()) continue;
 
-    num_candidates += pile.size();
+    stats.candidates += pile.size();
     for (std::size_t k = 0; k < pile.size(); ++k) {
-      if (!selected[i][k]) continue;
+      if (!selected[i - first][k]) continue;
 
       const auto &o = pile[k];
       // same validation as LoadOverlapsAndAlign
       if (o.lhs_end <= o.lhs_begin || o.rhs_end <= o.rhs_begin ||
           o.lhs_end > sequences[o.lhs_id]->inflated_len ||
           o.rhs_end > sequences[o.rhs_id]->inflated_len) {
-        ++skipped;
+        ++stats.skipped;
         continue;
       }
 
@@ -777,29 +855,16 @@ void Graph_Constructor::SelectCorrectionOverlaps(
       total_ovlp.rhs_end_original = o.rhs_end;
 
       extended_overlaps[i].emplace_back(std::move(total_ovlp));
-      ++kept;
+      ++stats.kept;
       if (graph_.piles_[o.rhs_id]->is_strong_contained()) {
         const std::uint32_t type = overlap_type_extended(
             o, graph_, sequences[o.lhs_id]->inflated_len,
             sequences[o.rhs_id]->inflated_len);
-        ++(type == 2 ? kept_contained_support : kept_dovetail_contained_support);
+        ++(type == 2 ? stats.kept_contained_support
+                     : stats.kept_dovetail_contained_support);
       }
     }
   }
-
-  std::vector<std::vector<correction_candidate>>().swap(candidates);
-
-  std::cerr << "[raven::SelectCorrectionOverlaps] kept " << kept << " / "
-            << num_candidates << " candidate overlaps ("
-            << (num_candidates ? 100.0 * kept / num_candidates : 0.0) << "%), "
-            << "window " << param.rf_window_size << ", top " << param.rf_top_k
-            << (param.rf_require_full_window ? ", full-window" : ", any-overlap")
-            << ", skipped " << skipped << " invalid, "
-            << std::fixed << timer.Stop() << "s" << std::endl;
-  std::cerr << "[raven::SelectCorrectionOverlaps] kept overlaps with a strongly "
-               "contained support read: " << kept_contained_support
-            << " contained in the target, " << kept_dovetail_contained_support
-            << " otherwise" << std::endl;
 }
 
 // void Graph_Constructor::LoadOverlapsAndAlign(Program_Parameters &param, std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, std::vector<std::vector<extended_overlap>> &extended_overlaps){
@@ -1121,7 +1186,10 @@ void Graph_Constructor::AlignCorrectionOverlaps(
     std::vector<std::vector<extended_overlap>> &extended_overlaps,
     std::uint32_t kmer_len,
     double max_edit_rate,
-    const std::function<void(std::uint32_t)> &pile_aligned) {
+    const std::function<void(std::uint32_t)> &pile_aligned,
+    std::uint32_t first,
+    std::uint32_t last) {
+  last = std::min<std::uint32_t>(last, sequences.size());
 
   // ========================================================================
   // TRIM TERMINAL EDLIB GAPS
@@ -1691,19 +1759,19 @@ void Graph_Constructor::AlignCorrectionOverlaps(
 
 
   alignment_futures.reserve(
-      sequences.size());
+      last > first ? last - first : 0);
 
 
   // Largest piles first, so a few expensive ones (repeats aligned without
   // anchors) do not run alone at the end.
   std::vector<std::uint64_t> pile_bases(sequences.size(), 0);
-  for (std::uint32_t i = 0; i < sequences.size(); ++i) {
+  for (std::uint32_t i = first; i < last; ++i) {
     for (const auto &overlap : extended_overlaps[i]) {
       pile_bases[i] += overlap.overlap.lhs_end - overlap.overlap.lhs_begin;
     }
   }
-  std::vector<std::uint32_t> pile_order(sequences.size());
-  std::iota(pile_order.begin(), pile_order.end(), 0);
+  std::vector<std::uint32_t> pile_order(last > first ? last - first : 0);
+  std::iota(pile_order.begin(), pile_order.end(), first);
   std::sort(pile_order.begin(), pile_order.end(),
             [&](std::uint32_t a, std::uint32_t b) {
               return pile_bases[a] > pile_bases[b];
@@ -1769,9 +1837,21 @@ void Graph_Constructor::ConstructOverlapsForCorrection(std::vector<std::unique_p
     containment_votes_.assign(sequences.size(), 0);
     containment_threshold_ = 3;
     correction_candidates_.assign(sequences.size(), {});
+    if (!param.spill_dir.empty()) {
+      candidate_spill_.reset(
+          new CandidateSpill(param.spill_dir, param.spill_groups, sequences.size()));
+    }
   }
 
   MapSequencesFast(sequences, extended_overlaps, timer, param);
+
+  if (candidate_spill_) {
+    candidate_spill_->Finish();
+    std::cerr << std::fixed << std::setprecision(2) << "[raven::] wrote "
+              << candidate_spill_->bytes_written() / (1024.0 * 1024.0 * 1024.0)
+              << " GB of candidates to " << candidate_spill_->num_groups()
+              << " files in " << candidate_spill_->dir() << std::endl;
+  }
 
   // After mapping, nothing on the correction path reads k-mer counts.
   internal_counter_.reset();
@@ -3592,6 +3672,12 @@ void Graph_Constructor::StoreCorrectionCandidate(
   }
   const std::uint32_t pile = candidate.lhs_id;
   if (containment_votes_[pile] >= containment_threshold_) {
+    return;
+  }
+  if (candidate_spill_) {
+    // what is already on disk for a pile that later becomes contained is
+    // skipped when read back
+    candidate_spill_->Add(candidate);
     return;
   }
   correction_candidates_[pile].emplace_back(std::move(candidate));
