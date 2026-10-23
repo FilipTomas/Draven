@@ -11,6 +11,10 @@
 #include <iomanip>
 #include <filesystem>
 #include <cassert>
+#include <string>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include "graph.hpp"
 #include "graph_constructor.h"
 #include "parser.h"
@@ -531,6 +535,34 @@ static void LogOverlapMemory(
             << cigars / gb << " GB CIGARs" << std::endl;
 }
 
+// The process's resident memory (VmRSS) in GB, or 0 if unknown.
+static double ResidentGb() {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.compare(0, 6, "VmRSS:") == 0) {
+      return std::strtod(line.c_str() + 6, nullptr) / (1024.0 * 1024.0);
+    }
+  }
+  return 0;
+}
+
+// Return heap memory freed by `stage` to the system and log the resident size
+// before and after. glibc keeps freed heap pages (e.g. the k-mer counter's
+// shards) mapped, so RSS would otherwise not show what is still in use.
+static void ReleaseFreedMemory(const char *stage) {
+  biosoup::Timer timer{};
+  timer.Start();
+  const double before = ResidentGb();
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
+  std::cerr << std::fixed << std::setprecision(1) << "[raven::] memory after "
+            << stage << ": RSS " << before << " -> " << ResidentGb()
+            << " GB after returning freed memory " << std::setprecision(3)
+            << timer.Stop() << "s" << std::endl;
+}
+
 void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences, Program_Parameters &param){
     std::vector<std::vector<extended_overlap>> extended_overlaps(sequences.size());
     biosoup::Timer timer{};
@@ -597,6 +629,7 @@ void Graph_Constructor::ConstructCorrectionOverlaps(std::vector<std::unique_ptr<
       LogOverlapMemory(correction_candidates_, "before selection");
       SelectCorrectionOverlaps(sequences, extended_overlaps, param);
       LogOverlapMemory(extended_overlaps, "after selection");
+      ReleaseFreedMemory("selection");
       AlignCorrectionOverlaps(sequences, extended_overlaps, param.kmer_len,
                           param.max_edit_rate, write_pile);
       LogOverlapMemory(extended_overlaps, "after alignment");
@@ -2957,6 +2990,9 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     std::cerr << "[raven::Graph::Construct] released the k-mer counter "
                  "(count classes kept per position)" << std::endl;
   }
+  if (param.correction_overlaps) {
+    ReleaseFreedMemory("sketching");
+  }
 
   // ---- build the minimizer index ----
   timer.Start();
@@ -2980,6 +3016,9 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
             << sequences.size() << " sequences" << (two_pass ? " (two-pass index) " : " ")
             << std::fixed << timer.Stop() << "s"
             << std::endl;
+  if (param.correction_overlaps) {
+    ReleaseFreedMemory("the index");
+  }
 
   // ---- unique k-mer bits of every read, for the overlaps' Jaccard ----
   if (!param.store_kmer_ids) {
@@ -3075,6 +3114,9 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     minimizer_engine.ClearReadStore();
   }
   minimizer_engine.ClearCountClasses();
+  if (param.correction_overlaps) {
+    ReleaseFreedMemory("mapping");
+  }
 }
 
 /*void Graph_Constructor::MapSequences(std::vector<std::unique_ptr<biosoup::NucleicAcid>> &sequences,
