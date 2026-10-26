@@ -393,6 +393,11 @@ void Graph_Constructor::LoadAndCount(
 
   internal_counter_ = std::make_unique<ram::KmerCounter>(
       param.kmer_len, thread_pool_, /*min_count=*/2, /*bloom_capacity_hint=*/bloom_hint);
+  // Correcting with --spill-dir, the qualities wait in a file until sketching,
+  // instead of in memory next to the counter.
+  if (param.correction_overlaps && !param.spill_dir.empty()) {
+    quality_spill_.reset(new QualitySpill(param.spill_dir));
+  }
 
   biosoup::Timer timer{};
   timer.Start();
@@ -419,6 +424,9 @@ void Graph_Constructor::LoadAndCount(
       internal_counter_->CountAsync(read.get());
     }
     for (auto &read : chunk) {
+      if (quality_spill_) {
+        quality_spill_->Add(*read);  // counting does not read qualities
+      }
       sequences.emplace_back(std::move(read));
     }
     total += chunk.size();
@@ -428,6 +436,12 @@ void Graph_Constructor::LoadAndCount(
   std::cerr << "[raven::] loaded + counted " << total << " sequences ("
             << internal_counter_->num_distinct() << " distinct k-mers >= 2) "
             << std::fixed << timer.Stop() << "s" << std::endl;
+  if (quality_spill_) {
+    quality_spill_->Finish();
+    std::cerr << std::fixed << std::setprecision(2) << "[raven::] wrote "
+              << quality_spill_->bytes_written() / (1024.0 * 1024.0 * 1024.0)
+              << " GB of qualities to " << quality_spill_->path() << std::endl;
+  }
 }
 
 void Graph_Constructor::Construct(
@@ -2325,6 +2339,9 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     std::vector<std::uint32_t> avg_base_qualities;
     std::vector<std::uint32_t> min_base_qualities;
 
+    if (quality_spill_) {
+      quality_spill_->Load(i, *sequences[i]);
+    }
     if (store_minimizers) {
       // Fused: also builds and stores this read's minimizer sketch.
       minimizer_engine.SketchAndMinimizeFastK(
@@ -2332,6 +2349,11 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
     } else {
       minimizer_engine.FastKSketchReadInto(
           sequences[i], 1U, ids, sketch, avg_base_qualities, min_base_qualities);
+    }
+    // Correcting, nothing else reads the qualities (1 B per base); assembly
+    // keeps them.
+    if (param.correction_overlaps) {
+      std::vector<std::uint8_t>().swap(sequences[i]->quality);
     }
     if (minimizer_counts) {
       minimizer_engine.CountMinimizers(sequences[i], minimizer_counts.get());
@@ -3056,13 +3078,8 @@ void Graph_Constructor::MapSequencesFast(std::vector<std::unique_ptr<biosoup::Nu
 
   graph_.PrintPiles();
 
-  // Correcting, qualities are read only by sketching (CNN features); free
-  // them (1 B per base). Assembly keeps them.
-  if (param.correction_overlaps) {
-    for (auto &it : sequences) {
-      std::vector<std::uint8_t>().swap(it->quality);
-    }
-  }
+  // Correcting, sketching freed each read's qualities after reading them.
+  quality_spill_.reset();
   if (keep_count_classes) {
     minimizer_engine.set_internal_counter(nullptr);
     internal_counter_.reset();

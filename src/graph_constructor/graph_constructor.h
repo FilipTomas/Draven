@@ -12,6 +12,7 @@
 #include "ram/kmer_counter.hpp"
 #include "correction_candidate.h"
 #include "candidate_spill.h"
+#include "quality_spill.h"
 #include <numeric>
 
 namespace overlap_selection {
@@ -213,6 +214,9 @@ void ResolveContainedReads(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& s
   // With --spill-dir, mapping writes the candidates here instead, and
   // selection reads them back one group of piles at a time.
   std::unique_ptr<CandidateSpill> candidate_spill_;
+  // With --spill-dir, LoadAndCount writes the qualities here and sketching
+  // reads each read's back.
+  std::unique_ptr<QualitySpill> quality_spill_;
 
   double disagreement_;
 };

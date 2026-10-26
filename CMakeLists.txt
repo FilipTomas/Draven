@@ -195,6 +195,7 @@ add_library(raven
   src/graph_constructor/overlap_parser.cpp
   src/graph_constructor/ram_overlap.cpp
   src/graph_constructor/candidate_spill.cpp
+  src/graph_constructor/quality_spill.cpp
   src/graph_constructor/cnn_preprocessing.cpp
   src/graph_constructor/overlap_selection.cpp
 )
