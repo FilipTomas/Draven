@@ -18,8 +18,8 @@ struct base_pile {
 
 // NW alignment with path that gives up (editDistance -1) once the edit
 // distance would exceed max_k; max_k < 0 means no limit. Like edlib's own
-// k = -1 it starts at k = 64 and doubles, so an alignment under the cap costs
-// and comes out the same (edlib computes the path from the final edit
+// k = -1 it doubles k until the edit distance fits, so an alignment under the
+// cap comes out the same (edlib computes the path from the final edit
 // distance, not from k). Unrelated sequence costs ~0.5 edits per base and,
 // uncapped, close to quadratic time.
 inline EdlibAlignResult capped_nw_align(
@@ -30,7 +30,12 @@ inline EdlibAlignResult capped_nw_align(
     return edlibAlign(query, query_len, target, target_len,
         edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, nullptr, 0));
   }
-  for (std::int64_t k = std::min<std::int64_t>(64, max_k);; k = std::min(2 * k, max_k)) {
+  // Each try that fails is a full banded pass, so a long piece starts near
+  // its likely edit distance (an eighth of it) instead of at 64; the result
+  // is the same for any k at or above the edit distance.
+  const std::int64_t k_start =
+      std::max<std::int64_t>(64, std::max(query_len, target_len) / 8);
+  for (std::int64_t k = std::min(k_start, max_k);; k = std::min(2 * k, max_k)) {
     EdlibAlignResult result = edlibAlign(query, query_len, target, target_len,
         edlibNewAlignConfig(static_cast<int>(k), EDLIB_MODE_NW, EDLIB_TASK_PATH, nullptr, 0));
     if (result.status != EDLIB_STATUS_OK || result.editDistance >= 0 || k == max_k) {
